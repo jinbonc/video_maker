@@ -1,0 +1,77 @@
+{
+  "ffmpeg_path": "C:\\ffmpeg-2026-05-21-git-0857141823-essentials_build\\bin\\ffmpeg.EXE",
+  "logo_path": "",
+  "music_path": "",
+  "scenes": [
+    {
+      "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/01_항만 전경.mp4",
+      "scene_name": "항만 전경",
+      "start_time": "00:00:00",
+      "end_time": "00:00:04.840",
+      "subtitle": "안전한 항만 물류의 시작"
+    },
+    {
+      "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/01_선박 접안.mp4",
+      "scene_name": "선박 접안",
+      "start_time": "00:00:00",
+      "end_time": "00:00:04.840",
+      "subtitle": "마린글로리 소금 하역 운영"
+    },
+    {
+      "video_path": "",
+      "scene_name": "TBM 회의",
+      "start_time": "00:00:00",
+      "end_time": "",
+      "subtitle": "작업 전 위험요인 공유"
+    },
+    {
+      "video_path": "",
+      "scene_name": "안전 준비",
+      "start_time": "00:00:00",
+      "end_time": "",
+      "subtitle": "기본을 지키는 안전문화"
+    },
+    {
+      "video_path": "",
+      "scene_name": "본선 하역",
+      "start_time": "00:00:00",
+      "end_time": "",
+      "subtitle": "체계적인 본선 하역"
+    },
+    {
+      "video_path": "",
+      "scene_name": "호퍼 투입",
+      "start_time": "00:00:00",
+      "end_time": "",
+      "subtitle": "안정적인 하역 공정"
+    },
+    {
+      "video_path": "",
+      "scene_name": "컨베이어 이송",
+      "start_time": "00:00:00",
+      "end_time": "",
+      "subtitle": "설비와 연계된 이송 시스템"
+    },
+    {
+      "video_path": "",
+      "scene_name": "설비 점검",
+      "start_time": "00:00:00",
+      "end_time": "",
+      "subtitle": "예방점검을 통한 안정 운영"
+    },
+    {
+      "video_path": "",
+      "scene_name": "무전 교신",
+      "start_time": "00:00:00",
+      "end_time": "",
+      "subtitle": "현장 중심의 신속한 대응"
+    },
+    {
+      "video_path": "",
+      "scene_name": "작업 완료",
+      "start_time": "00:00:00",
+      "end_time": "",
+      "subtitle": "안전과 신뢰로 완성하는 하역 작업"
+    }
+  ]
+}

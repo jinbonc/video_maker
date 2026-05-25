@@ -26,13 +26,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
-    QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -41,6 +43,10 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QPlainTextEdit,
+    QSlider,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -51,6 +57,18 @@ from PySide6.QtWidgets import (
 APP_NAME = "MarineGlory Video Maker"
 OUTPUT_WIDTH = 1920
 OUTPUT_HEIGHT = 1080
+INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
+SUBTITLE_MASK_NONE = "없음"
+SUBTITLE_MASK_CROP = "하단 크롭"
+SUBTITLE_MASK_BLUR = "하단 블러"
+SUBTITLE_MASK_BAR = "하단 바 덮기"
+SUBTITLE_MASK_MODES = [
+    SUBTITLE_MASK_NONE,
+    SUBTITLE_MASK_CROP,
+    SUBTITLE_MASK_BLUR,
+    SUBTITLE_MASK_BAR,
+]
 
 
 # 초기 템플릿: 사용자가 촬영 영상을 추가하면 이 순서대로 장면명/자막을
@@ -216,6 +234,12 @@ def format_seconds_for_display(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{remain:06.3f}"
 
 
+def format_milliseconds_for_display(milliseconds: int) -> str:
+    """QtMultimedia의 ms 단위 재생 위치를 HH:MM:SS.mmm 문자열로 바꿉니다."""
+
+    return format_seconds_for_display(max(milliseconds, 0) / 1000)
+
+
 def format_seconds_for_ass(seconds: float) -> str:
     """ASS 자막 Dialogue 시간 형식(H:MM:SS.cc)으로 변환합니다."""
 
@@ -227,6 +251,63 @@ def format_seconds_for_ass(seconds: float) -> str:
     secs = centiseconds // 100
     centis = centiseconds % 100
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+def sanitize_filename_part(value: str, fallback: str = "scene") -> str:
+    """Windows 파일명으로 사용할 수 없는 문자를 _로 바꿔 안전한 이름을 만듭니다."""
+
+    safe_value = INVALID_FILENAME_CHARS.sub("_", value.strip())
+    safe_value = safe_value.strip(" .")
+    return safe_value or fallback
+
+
+def is_supported_video_file(path: str) -> bool:
+    """입력 영상은 mp4/mov/m4v를 지원하고, 출력은 mp4로 통일합니다."""
+
+    return Path(path).suffix.lower() in ALLOWED_VIDEO_EXTENSIONS
+
+
+def apply_subtitle_mask_filter(
+    subtitle_mask_mode: str,
+    subtitle_height: int,
+    subtitle_y: int | None,
+) -> tuple[str, str] | None:
+    """
+    기존 영상에 박혀 있는 하단 자막을 가리기 위한 ffmpeg 필터를 만듭니다.
+
+    반환값의 첫 번째 값은 ffmpeg 옵션 종류입니다.
+    - "vf": 단일 비디오 필터라서 -vf 로 전달합니다.
+    - "filter_complex": split/overlay가 필요해서 -filter_complex 와 [v] map을 사용합니다.
+
+    subtitle_y가 비어 있으면 영상 높이에서 subtitle_height를 뺀 하단 영역을 자동으로 잡습니다.
+    시작 Y를 사용자가 직접 넣으면 그 위치부터 subtitle_height만큼을 처리합니다.
+    """
+
+    if subtitle_mask_mode == SUBTITLE_MASK_NONE:
+        return None
+
+    y_expr = str(subtitle_y) if subtitle_y is not None else f"ih-{subtitle_height}"
+    overlay_y_expr = str(subtitle_y) if subtitle_y is not None else f"H-{subtitle_height}"
+
+    if subtitle_mask_mode == SUBTITLE_MASK_CROP:
+        # 하단 크롭은 자막이 있는 아래 영역을 잘라낸 뒤 최종 클립 크기를 1920x1080으로 맞춥니다.
+        crop_height_expr = str(subtitle_y) if subtitle_y is not None else f"ih-{subtitle_height}"
+        return "vf", f"crop=iw:{crop_height_expr}:0:0,scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}"
+
+    if subtitle_mask_mode == SUBTITLE_MASK_BLUR:
+        # 원본 프레임을 유지하고 자막 영역만 잘라 blur 처리한 뒤 같은 위치에 다시 올립니다.
+        filter_text = (
+            f"[0:v]split=2[base][blur];"
+            f"[blur]crop=iw:{subtitle_height}:0:{y_expr},boxblur=12[blurred];"
+            f"[base][blurred]overlay=0:{overlay_y_expr}[v]"
+        )
+        return "filter_complex", filter_text
+
+    if subtitle_mask_mode == SUBTITLE_MASK_BAR:
+        # 반투명 검정 바를 덮어 원본 자막이 홍보영상 자막과 겹치지 않도록 가립니다.
+        return "vf", f"drawbox=x=0:y={y_expr}:w=iw:h={subtitle_height}:color=black@0.75:t=fill"
+
+    raise ValueError(f"지원하지 않는 기존 자막 처리 방식입니다: {subtitle_mask_mode}")
 
 
 def escape_ass_text(text: str) -> str:
@@ -535,25 +616,264 @@ class ExportWorker(QObject):
         shutil.copy2(video_path, self.output_path)
 
 
+class ClipExportWorker(QObject):
+    """원본 영상의 지정 구간만 잘라 개별 MP4 클립으로 저장하는 작업자입니다."""
+
+    log = Signal(str)
+    progress = Signal(int, str)
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        ffmpeg_path: str,
+        scenes: list[Scene],
+        output_dir: str,
+        start_index: int = 1,
+        subtitle_mask_mode: str = SUBTITLE_MASK_NONE,
+        subtitle_mask_height: int = 120,
+        subtitle_mask_y: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path
+        self.scenes = scenes
+        self.output_dir = output_dir
+        self.start_index = start_index
+        self.subtitle_mask_mode = subtitle_mask_mode
+        self.subtitle_mask_height = subtitle_mask_height
+        self.subtitle_mask_y = subtitle_mask_y
+
+    def run(self) -> None:
+        """검증 후 선택된 장면들을 순서대로 개별 MP4 파일로 저장합니다."""
+
+        try:
+            self._validate()
+            output_path = Path(self.output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+
+            total_count = len(self.scenes)
+            for offset, scene in enumerate(self.scenes):
+                clip_number = self.start_index + offset
+                label = scene.scene_name or Path(scene.video_path).stem or "scene"
+                safe_name = sanitize_filename_part(label)
+                clip_path = output_path / f"{clip_number:02d}_{safe_name}.mp4"
+
+                start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
+                end_seconds = parse_time_to_seconds(scene.end_time.strip())
+                duration_seconds = end_seconds - start_seconds
+
+                message = f"[{offset + 1}/{total_count}] 클립 저장 중: {clip_path}"
+                self.progress.emit(int((offset / total_count) * 100), message)
+                self.log.emit(message)
+
+                if self.subtitle_mask_mode == SUBTITLE_MASK_NONE:
+                    self._cut_clip_fast_copy(
+                        scene.video_path,
+                        clip_path,
+                        start_seconds,
+                        duration_seconds,
+                    )
+                else:
+                    self._cut_clip_with_subtitle_mask(
+                        scene.video_path,
+                        clip_path,
+                        start_seconds,
+                        duration_seconds,
+                    )
+                self.log.emit(f"저장 완료: {clip_path}")
+
+            self.progress.emit(100, "클립 저장 완료")
+            self.finished.emit(str(output_path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _validate(self) -> None:
+        """ffmpeg, 입력 영상, 시간값, 출력 폴더 조건을 미리 확인합니다."""
+
+        if not self.ffmpeg_path or not Path(self.ffmpeg_path).exists():
+            raise FileNotFoundError("ffmpeg.exe 경로가 없습니다. [ffmpeg 선택]으로 지정해 주세요.")
+        if not self.scenes:
+            raise ValueError("저장할 장면이 없습니다.")
+        if self.subtitle_mask_mode not in SUBTITLE_MASK_MODES:
+            raise ValueError("기존 자막 처리 방식이 올바르지 않습니다.")
+        if not 30 <= self.subtitle_mask_height <= 400:
+            raise ValueError("자막 영역 높이는 30~400px 범위로 입력해 주세요.")
+        if self.subtitle_mask_y is not None and self.subtitle_mask_y < 0:
+            raise ValueError("자막 영역 시작 Y 위치는 0 이상의 숫자로 입력해 주세요.")
+
+        for index, scene in enumerate(self.scenes, start=1):
+            label = scene.scene_name or Path(scene.video_path).name or f"{index}번 장면"
+            if not scene.video_path or not Path(scene.video_path).exists():
+                raise FileNotFoundError(f"{index}번 장면 영상 파일을 찾을 수 없습니다: {scene.video_path}")
+            if not scene.end_time.strip():
+                raise ValueError(f"{index}번 장면 종료 시간이 비어 있습니다: {label}")
+            try:
+                start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
+                end_seconds = parse_time_to_seconds(scene.end_time.strip())
+            except ValueError as exc:
+                raise ValueError(f"{index}번 장면 시간 형식이 올바르지 않습니다: {label}") from exc
+            if start_seconds < 0 or end_seconds <= start_seconds:
+                raise ValueError(f"{index}번 장면 종료 시간은 시작 시간보다 커야 합니다: {label}")
+
+    def _cut_clip_fast_copy(
+        self,
+        source_path: str,
+        output_path: Path,
+        start_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        """
+        빠른 컷 저장 방식입니다.
+
+        -c copy는 재인코딩 없이 스트림을 복사하므로 빠르고 화질 손실이 거의 없습니다.
+        다만 원본 영상의 키프레임 위치에 맞춰 잘릴 수 있어 시작/끝 지점이 조금 어긋날 수 있습니다.
+        정확한 컷이 필요하면 아래 _cut_clip_precise_reencode() 방식으로 전환하면 됩니다.
+        """
+
+        command = [
+            self.ffmpeg_path,
+            "-y",
+            "-ss",
+            format_seconds_for_ffmpeg(start_seconds),
+            "-i",
+            source_path,
+            "-t",
+            format_seconds_for_ffmpeg(duration_seconds),
+            "-c",
+            "copy",
+            str(output_path),
+        ]
+        run_process(command, self.log)
+
+    def _cut_clip_precise_reencode(
+        self,
+        source_path: str,
+        output_path: Path,
+        start_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        """정확한 컷이 필요할 때 사용할 재인코딩 방식입니다. 현재 UI 기본값은 빠른 컷입니다."""
+
+        command = [
+            self.ffmpeg_path,
+            "-y",
+            "-ss",
+            format_seconds_for_ffmpeg(start_seconds),
+            "-i",
+            source_path,
+            "-t",
+            format_seconds_for_ffmpeg(duration_seconds),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            str(output_path),
+        ]
+        run_process(command, self.log)
+
+    def _cut_clip_with_subtitle_mask(
+        self,
+        source_path: str,
+        output_path: Path,
+        start_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        """
+        기존 자막 가리기 필터를 적용해 클립을 저장합니다.
+
+        필터가 들어가면 비디오 스트림 복사(-c copy)를 사용할 수 없으므로 H.264로 재인코딩합니다.
+        오디오는 원본이 없을 수도 있어 0:a? optional map을 사용하고, 있으면 AAC로 맞춥니다.
+        """
+
+        filter_kind, filter_text = apply_subtitle_mask_filter(
+            self.subtitle_mask_mode,
+            self.subtitle_mask_height,
+            self.subtitle_mask_y,
+        ) or ("", "")
+
+        command = [
+            self.ffmpeg_path,
+            "-y",
+            "-ss",
+            format_seconds_for_ffmpeg(start_seconds),
+            "-i",
+            source_path,
+            "-t",
+            format_seconds_for_ffmpeg(duration_seconds),
+        ]
+
+        if filter_kind == "filter_complex":
+            command.extend(["-filter_complex", filter_text, "-map", "[v]", "-map", "0:a?"])
+        else:
+            command.extend(["-vf", filter_text, "-map", "0:v:0", "-map", "0:a?"])
+
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                str(output_path),
+            ]
+        )
+        self.log.emit(f"기존 자막 처리 적용: {self.subtitle_mask_mode}")
+        run_process(command, self.log)
+
+
 class MainWindow(QMainWindow):
     """MarineGlory Video Maker 메인 GUI입니다."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1280, 820)
+        self.resize(1280, 980)
 
         self.ffmpeg_edit = QLineEdit(find_default_ffmpeg())
         self.logo_edit = QLineEdit()
         self.music_edit = QLineEdit()
         self.output_edit = QLineEdit(str(Path.cwd() / "marineglory_promo.mp4"))
+        self.clip_output_edit = QLineEdit(str(Path.cwd() / "clips"))
+        self.subtitle_mask_mode_combo = QComboBox()
+        self.subtitle_mask_height_spin = QSpinBox()
+        self.subtitle_mask_y_edit = QLineEdit()
         self.table = QTableWidget(0, 5)
         self.log_edit = QPlainTextEdit()
         self.progress_bar = QProgressBar()
-        self.export_button = QPushButton("최종 MP4 생성")
+        self.export_selected_clip_button = QPushButton("선택 구간 클립 저장")
+        self.export_all_clips_button = QPushButton("전체 구간 클립 일괄 저장")
+        self.export_button = QPushButton("최종 홍보영상 만들기")
+
+        # 영상 미리보기 상태: QtMultimedia는 ffmpeg 자르기와 별개로 동작하므로
+        # 코덱 문제로 재생에 실패해도 기존 클립 저장 기능은 계속 사용할 수 있습니다.
+        self.preview_video_widget = QVideoWidget()
+        self.preview_player = QMediaPlayer(self)
+        self.preview_audio_output = QAudioOutput(self)
+        self.preview_slider = QSlider(Qt.Horizontal)
+        self.preview_time_label = QLabel("00:00:00 / 00:00:00")
+        self.preview_slider_dragging = False
+        self.preview_current_path = ""
+        self.preview_stop_at_ms: int | None = None
 
         self.worker_thread: QThread | None = None
         self.worker: ExportWorker | None = None
+        self.clip_worker_thread: QThread | None = None
+        self.clip_worker: ClipExportWorker | None = None
 
         self._build_ui()
         self._load_default_template()
@@ -564,71 +884,175 @@ class MainWindow(QMainWindow):
 
         root = QWidget()
         main_layout = QVBoxLayout(root)
+        main_layout.setContentsMargins(10, 10, 10, 10)
         self.setCentralWidget(root)
 
-        path_box = QGroupBox("파일 설정")
+        # Main workspace: left controls and right preview stay resizable through a splitter.
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        main_layout.addWidget(splitter)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 6, 0)
+        left_layout.setSpacing(8)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([580, 700])
+
+        # Common settings: ffmpeg path used by all export and clipping jobs.
+        path_box = QGroupBox("공통 설정")
         path_layout = QGridLayout(path_box)
-        main_layout.addWidget(path_box)
+        left_layout.addWidget(path_box)
 
         ffmpeg_button = QPushButton("ffmpeg 선택")
-        logo_button = QPushButton("로고 PNG 선택")
-        music_button = QPushButton("배경음악 MP3 선택")
-        output_button = QPushButton("출력 MP4 선택")
-
         path_layout.addWidget(QLabel("ffmpeg.exe"), 0, 0)
         path_layout.addWidget(self.ffmpeg_edit, 0, 1)
         path_layout.addWidget(ffmpeg_button, 0, 2)
-        path_layout.addWidget(QLabel("회사 로고 PNG"), 1, 0)
-        path_layout.addWidget(self.logo_edit, 1, 1)
-        path_layout.addWidget(logo_button, 1, 2)
-        path_layout.addWidget(QLabel("배경음악 MP3"), 2, 0)
-        path_layout.addWidget(self.music_edit, 2, 1)
-        path_layout.addWidget(music_button, 2, 2)
-        path_layout.addWidget(QLabel("최종 출력 MP4"), 3, 0)
-        path_layout.addWidget(self.output_edit, 3, 1)
-        path_layout.addWidget(output_button, 3, 2)
 
-        scene_buttons = QHBoxLayout()
-        main_layout.addLayout(scene_buttons)
+        # Clip tools: import originals and save selected/all scene ranges as separate clips.
+        clip_box = QGroupBox("1. 원본 영상 자르기 / 클립 만들기")
+        clip_layout = QGridLayout(clip_box)
+        left_layout.addWidget(clip_box)
 
-        add_video_button = QPushButton("MP4 영상 추가")
+        clip_output_button = QPushButton("잘라낸 클립 저장 폴더 선택")
+        add_video_button = QPushButton("원본 영상 추가")
+        self.subtitle_mask_mode_combo.addItems(SUBTITLE_MASK_MODES)
+        self.subtitle_mask_height_spin.setRange(30, 400)
+        self.subtitle_mask_height_spin.setValue(120)
+        self.subtitle_mask_height_spin.setSuffix(" px")
+        self.subtitle_mask_y_edit.setPlaceholderText("비우면 하단 자동")
+        clip_layout.addWidget(add_video_button, 0, 0, 1, 3)
+        clip_layout.addWidget(QLabel("클립 저장 폴더"), 1, 0)
+        clip_layout.addWidget(self.clip_output_edit, 1, 1)
+        clip_layout.addWidget(clip_output_button, 1, 2)
+        clip_layout.addWidget(QLabel("기존 자막 처리 방식"), 2, 0)
+        clip_layout.addWidget(self.subtitle_mask_mode_combo, 2, 1, 1, 2)
+        clip_layout.addWidget(QLabel("자막 영역 높이"), 3, 0)
+        clip_layout.addWidget(self.subtitle_mask_height_spin, 3, 1, 1, 2)
+        clip_layout.addWidget(QLabel("자막 영역 시작 Y"), 4, 0)
+        clip_layout.addWidget(self.subtitle_mask_y_edit, 4, 1, 1, 2)
+        clip_layout.addWidget(self.export_selected_clip_button, 5, 0, 1, 2)
+        clip_layout.addWidget(self.export_all_clips_button, 5, 2)
+
+        # Scene table: give the list the remaining vertical space on the left.
+        scene_list_box = QGroupBox("2. 장면 목록")
+        scene_list_layout = QVBoxLayout(scene_list_box)
+        left_layout.addWidget(scene_list_box, stretch=1)
+        self._setup_table()
+        self.table.setMinimumHeight(320)
+        scene_list_layout.addWidget(self.table)
+
+        # Scene management: reorder/delete scenes and restore the salt unloading template.
+        scene_box = QGroupBox("3. 장면 목록 정리")
+        scene_layout = QGridLayout(scene_box)
+        left_layout.addWidget(scene_box)
+
         remove_button = QPushButton("선택 장면 삭제")
         up_button = QPushButton("위로 이동")
         down_button = QPushButton("아래로 이동")
+        template_button = QPushButton("소금하역 템플릿 불러오기")
+        scene_layout.addWidget(remove_button, 0, 0)
+        scene_layout.addWidget(up_button, 0, 1)
+        scene_layout.addWidget(down_button, 0, 2)
+        scene_layout.addWidget(template_button, 1, 0, 1, 3)
+
+        # Project management: save and reload the current JSON project state.
+        project_box = QGroupBox("4. 프로젝트 관리")
+        project_layout = QGridLayout(project_box)
+        left_layout.addWidget(project_box)
+
         save_button = QPushButton("프로젝트 저장")
         load_button = QPushButton("프로젝트 불러오기")
-        template_button = QPushButton("초기 템플릿 다시 만들기")
+        project_layout.addWidget(save_button, 0, 0)
+        project_layout.addWidget(load_button, 0, 1)
 
-        for button in [
-            add_video_button,
-            remove_button,
-            up_button,
-            down_button,
-            save_button,
-            load_button,
-            template_button,
-            self.export_button,
-        ]:
-            scene_buttons.addWidget(button)
+        # Preview tools: the video area grows with the window and key range buttons stay visible.
+        preview_box = QGroupBox("영상 미리보기 / 구간 지정")
+        preview_layout = QGridLayout(preview_box)
+        right_layout.addWidget(preview_box, stretch=4)
 
-        self._setup_table()
-        main_layout.addWidget(self.table, stretch=1)
+        preview_play_button = QPushButton("재생")
+        preview_pause_button = QPushButton("일시정지")
+        preview_stop_button = QPushButton("정지")
+        preview_back_button = QPushButton("5초 뒤로")
+        preview_forward_button = QPushButton("5초 앞으로")
+        preview_set_start_button = QPushButton("현재 위치를 시작 시간으로")
+        preview_set_end_button = QPushButton("현재 위치를 종료 시간으로")
+        preview_range_button = QPushButton("선택 구간 미리보기")
+        for button in (preview_set_start_button, preview_set_end_button, preview_range_button):
+            button.setMinimumHeight(38)
+        self.preview_video_widget.setMinimumHeight(420)
+        self.preview_video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_slider.setRange(0, 0)
 
+        preview_layout.addWidget(self.preview_video_widget, 0, 0, 1, 6)
+        preview_layout.addWidget(preview_set_start_button, 1, 0, 1, 2)
+        preview_layout.addWidget(preview_set_end_button, 1, 2, 1, 2)
+        preview_layout.addWidget(preview_range_button, 1, 4, 1, 2)
+        preview_layout.addWidget(self.preview_time_label, 2, 0, 1, 6)
+        preview_layout.addWidget(self.preview_slider, 3, 0, 1, 6)
+        preview_layout.addWidget(preview_play_button, 4, 0)
+        preview_layout.addWidget(preview_pause_button, 4, 1)
+        preview_layout.addWidget(preview_stop_button, 4, 2)
+        preview_layout.addWidget(preview_back_button, 4, 3)
+        preview_layout.addWidget(preview_forward_button, 4, 4)
+        preview_layout.setRowStretch(0, 1)
+
+        # Final export: logo, music, destination path, and render command.
+        final_box = QGroupBox("최종 홍보영상 만들기")
+        final_layout = QGridLayout(final_box)
+        right_layout.addWidget(final_box)
+
+        logo_button = QPushButton("회사 로고 PNG 선택")
+        music_button = QPushButton("배경음악 MP3 선택")
+        output_button = QPushButton("최종 영상 저장 위치 선택")
+        final_layout.addWidget(QLabel("회사 로고 PNG"), 0, 0)
+        final_layout.addWidget(self.logo_edit, 0, 1)
+        final_layout.addWidget(logo_button, 0, 2)
+        final_layout.addWidget(QLabel("배경음악 MP3"), 1, 0)
+        final_layout.addWidget(self.music_edit, 1, 1)
+        final_layout.addWidget(music_button, 1, 2)
+        final_layout.addWidget(QLabel("최종 출력 MP4"), 2, 0)
+        final_layout.addWidget(self.output_edit, 2, 1)
+        final_layout.addWidget(output_button, 2, 2)
+        final_layout.addWidget(self.export_button, 3, 0, 1, 3)
+
+        # Progress and logs: keep status visible without taking space from the preview.
+        progress_box = QGroupBox("진행률 / 로그")
+        progress_layout = QVBoxLayout(progress_box)
+        right_layout.addWidget(progress_box, stretch=1)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("대기 중")
-        main_layout.addWidget(self.progress_bar)
-
-        log_label = QLabel("처리 로그")
-        main_layout.addWidget(log_label)
+        progress_layout.addWidget(self.progress_bar)
         self.log_edit.setReadOnly(True)
         self.log_edit.setMaximumBlockCount(3000)
-        main_layout.addWidget(self.log_edit, stretch=1)
+        self.log_edit.setMaximumHeight(180)
+        progress_layout.addWidget(self.log_edit)
+
+        # Preview wiring: mirror QMediaPlayer state into the slider/time label.
+        self.preview_player.setAudioOutput(self.preview_audio_output)
+        self.preview_player.setVideoOutput(self.preview_video_widget)
+        self.preview_audio_output.setVolume(0.7)
+        self.preview_player.positionChanged.connect(self._preview_position_changed)
+        self.preview_player.durationChanged.connect(self._preview_duration_changed)
+        self.preview_player.errorOccurred.connect(self._preview_error_occurred)
+        self.preview_slider.sliderPressed.connect(self._preview_slider_pressed)
+        self.preview_slider.sliderReleased.connect(self._preview_slider_released)
+        self.preview_slider.valueChanged.connect(self._preview_slider_value_changed)
 
         ffmpeg_button.clicked.connect(self.choose_ffmpeg)
         logo_button.clicked.connect(self.choose_logo)
         music_button.clicked.connect(self.choose_music)
         output_button.clicked.connect(self.choose_output)
+        clip_output_button.clicked.connect(self.choose_clip_output_dir)
         add_video_button.clicked.connect(self.add_videos)
         remove_button.clicked.connect(self.remove_selected_scene)
         up_button.clicked.connect(lambda: self.move_selected_scene(-1))
@@ -636,7 +1060,17 @@ class MainWindow(QMainWindow):
         save_button.clicked.connect(self.save_project)
         load_button.clicked.connect(self.load_project)
         template_button.clicked.connect(self.reset_template)
+        self.export_selected_clip_button.clicked.connect(self.export_selected_clip)
+        self.export_all_clips_button.clicked.connect(self.export_all_clips)
         self.export_button.clicked.connect(self.export_video)
+        preview_play_button.clicked.connect(self.preview_player.play)
+        preview_pause_button.clicked.connect(self.preview_player.pause)
+        preview_stop_button.clicked.connect(self._stop_preview)
+        preview_back_button.clicked.connect(lambda: self._seek_preview_by(-5000))
+        preview_forward_button.clicked.connect(lambda: self._seek_preview_by(5000))
+        preview_set_start_button.clicked.connect(self.set_preview_position_as_start_time)
+        preview_set_end_button.clicked.connect(self.set_preview_position_as_end_time)
+        preview_range_button.clicked.connect(self.preview_selected_range)
 
     def _setup_table(self) -> None:
         """장면 목록 표의 컬럼과 기본 편집 동작을 설정합니다."""
@@ -651,6 +1085,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.itemSelectionChanged.connect(self.load_selected_row_preview)
 
     def _warn_if_ffmpeg_missing(self) -> None:
         """ffmpeg.exe가 없으면 사용자가 바로 알 수 있도록 안내합니다."""
@@ -701,6 +1136,172 @@ class MainWindow(QMainWindow):
             start_time=text(2) or "00:00:00",
             end_time=text(3),
             subtitle=text(4),
+        )
+
+    def _set_table_text(self, row: int, column: int, value: str) -> None:
+        """표 셀이 비어 있어도 안전하게 값을 넣기 위한 작은 헬퍼입니다."""
+
+        item = self.table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem()
+            self.table.setItem(row, column, item)
+        item.setText(value)
+        if column in (2, 3):
+            item.setTextAlignment(Qt.AlignCenter)
+
+    def load_selected_row_preview(self) -> None:
+        """
+        표에서 선택한 행의 원본 영상을 프로그램 안 미리보기 플레이어에 로드합니다.
+
+        QMediaPlayer는 PC 코덱/드라이버 환경에 따라 일부 영상이 재생되지 않을 수 있습니다.
+        이 경우에도 ffmpeg 기반 자르기 기능은 독립적으로 동작하므로 로그 안내만 남깁니다.
+        """
+
+        row = self.table.currentRow()
+        if row < 0:
+            return
+
+        scene = self._scene_from_row(row)
+        video_path = scene.video_path.strip()
+        if not video_path:
+            self.log(f"미리보기: {row + 1}번 장면에 영상 파일이 없습니다.")
+            return
+        if not Path(video_path).exists():
+            self.log(f"미리보기: 영상 파일을 찾을 수 없습니다: {video_path}")
+            return
+
+        if video_path != self.preview_current_path:
+            self.preview_stop_at_ms = None
+            self.preview_current_path = video_path
+            self.preview_player.setSource(QUrl.fromLocalFile(video_path))
+            self.preview_slider.setValue(0)
+            self.preview_time_label.setText("00:00:00 / 00:00:00")
+            self.log(f"미리보기 영상 로드: {video_path}")
+
+        start_text = scene.start_time.strip() or "00:00:00"
+        end_text = scene.end_time.strip() or "(미입력)"
+        self.log(f"선택 장면 구간: 시작 {start_text}, 종료 {end_text}")
+
+    def _preview_position_changed(self, position_ms: int) -> None:
+        """재생 위치가 바뀔 때 시간 표시와 슬라이더를 갱신하고 구간 미리보기를 종료합니다."""
+
+        if not self.preview_slider_dragging:
+            self.preview_slider.setValue(position_ms)
+        self._update_preview_time_label(position_ms, self.preview_player.duration())
+
+        if self.preview_stop_at_ms is not None and position_ms >= self.preview_stop_at_ms:
+            self.preview_player.pause()
+            self.preview_stop_at_ms = None
+            self.log("선택 구간 미리보기 종료")
+
+    def _preview_duration_changed(self, duration_ms: int) -> None:
+        """영상 길이가 확인되면 슬라이더 범위를 영상 전체 길이에 맞춥니다."""
+
+        self.preview_slider.setRange(0, max(duration_ms, 0))
+        self._update_preview_time_label(self.preview_player.position(), duration_ms)
+
+    def _preview_error_occurred(self, *args: Any) -> None:
+        """미리보기 재생 실패를 로그에 남깁니다. ffmpeg 자르기 기능은 계속 사용할 수 있습니다."""
+
+        error_message = self.preview_player.errorString().strip()
+        if not error_message:
+            error_message = "이 PC의 코덱/QtMultimedia 환경에서 미리보기를 재생하지 못했습니다."
+        self.log(f"미리보기 오류: {error_message}")
+
+    def _preview_slider_pressed(self) -> None:
+        """사용자가 슬라이더를 잡고 있는 동안 positionChanged 업데이트와 충돌하지 않게 표시합니다."""
+
+        self.preview_slider_dragging = True
+
+    def _preview_slider_released(self) -> None:
+        """슬라이더에서 손을 떼면 플레이어 위치를 해당 지점으로 이동합니다."""
+
+        self.preview_slider_dragging = False
+        self.preview_player.setPosition(self.preview_slider.value())
+
+    def _preview_slider_value_changed(self, value: int) -> None:
+        """드래그 중에는 시간 라벨을 먼저 갱신하고, 실제 이동은 release 시점에 수행합니다."""
+
+        if self.preview_slider_dragging:
+            self._update_preview_time_label(value, self.preview_player.duration())
+
+    def _update_preview_time_label(self, position_ms: int, duration_ms: int) -> None:
+        """현재 재생 위치와 전체 길이를 HH:MM:SS.mmm 형식으로 표시합니다."""
+
+        current_text = format_milliseconds_for_display(position_ms)
+        duration_text = format_milliseconds_for_display(duration_ms)
+        self.preview_time_label.setText(f"{current_text} / {duration_text}")
+
+    def _stop_preview(self) -> None:
+        """미리보기 재생을 멈추고 구간 미리보기 종료 지점도 초기화합니다."""
+
+        self.preview_stop_at_ms = None
+        self.preview_player.stop()
+
+    def _seek_preview_by(self, delta_ms: int) -> None:
+        """Move the preview position while keeping it inside the loaded video range."""
+
+        duration_ms = max(self.preview_player.duration(), 0)
+        current_ms = self.preview_player.position()
+        next_ms = max(0, min(current_ms + delta_ms, duration_ms))
+        self.preview_player.setPosition(next_ms)
+        self._update_preview_time_label(next_ms, duration_ms)
+
+    def set_preview_position_as_start_time(self) -> None:
+        """현재 재생 위치를 선택 행의 시작 시간 컬럼에 입력합니다."""
+
+        self._set_preview_position_to_time_column(2, "시작 시간")
+
+    def set_preview_position_as_end_time(self) -> None:
+        """현재 재생 위치를 선택 행의 종료 시간 컬럼에 입력합니다."""
+
+        self._set_preview_position_to_time_column(3, "종료 시간")
+
+    def _set_preview_position_to_time_column(self, column: int, label: str) -> None:
+        """현재 미리보기 위치를 선택 행의 시간 컬럼에 기록합니다."""
+
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "장면 선택 필요", "시간을 입력할 장면 행을 선택해 주세요.")
+            return
+
+        time_text = format_milliseconds_for_display(self.preview_player.position())
+        self._set_table_text(row, column, time_text)
+        self.log(f"{row + 1}번 장면 {label} 지정: {time_text}")
+
+    def preview_selected_range(self) -> None:
+        """선택 행의 시작~종료 시간만 플레이어에서 재생해 구간을 확인합니다."""
+
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "장면 선택 필요", "미리보기할 장면 행을 선택해 주세요.")
+            return
+
+        scene = self._scene_from_row(row)
+        if not scene.end_time.strip():
+            QMessageBox.information(self, "종료 시간 필요", "선택 구간 미리보기를 위해 종료 시간을 지정해 주세요.")
+            return
+
+        try:
+            start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
+            end_seconds = parse_time_to_seconds(scene.end_time.strip())
+        except ValueError:
+            QMessageBox.warning(self, "시간 형식 오류", "시작 시간 또는 종료 시간 형식이 올바르지 않습니다.")
+            return
+
+        if start_seconds < 0 or end_seconds <= start_seconds:
+            QMessageBox.warning(self, "구간 확인 필요", "종료 시간은 시작 시간보다 커야 합니다.")
+            return
+
+        if scene.video_path.strip() and scene.video_path.strip() != self.preview_current_path:
+            self.load_selected_row_preview()
+
+        self.preview_stop_at_ms = int(end_seconds * 1000)
+        self.preview_player.setPosition(int(start_seconds * 1000))
+        self.preview_player.play()
+        self.log(
+            "선택 구간 미리보기 시작: "
+            f"{format_seconds_for_display(start_seconds)} ~ {format_seconds_for_display(end_seconds)}"
         )
 
     def _all_scenes(self) -> list[Scene]:
@@ -763,19 +1364,34 @@ class MainWindow(QMainWindow):
                 file_path += ".mp4"
             self.output_edit.setText(file_path)
 
+    def choose_clip_output_dir(self) -> None:
+        """개별 클립 MP4를 저장할 폴더를 선택합니다."""
+
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "잘라낸 클립 저장 폴더 선택",
+            self.clip_output_edit.text().strip() or str(Path.cwd()),
+        )
+        if folder_path:
+            self.clip_output_edit.setText(folder_path)
+
     def add_videos(self) -> None:
-        """여러 MP4 파일을 추가합니다. 빈 템플릿 행이 있으면 먼저 채웁니다."""
+        """여러 원본 영상 파일을 추가합니다. 빈 템플릿 행이 있으면 먼저 채웁니다."""
 
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "MP4 영상 여러 개 추가",
+            "원본 영상 여러 개 추가",
             str(Path.cwd()),
-            "MP4 영상 (*.mp4);;모든 파일 (*.*)",
+            "영상 파일 (*.mp4 *.mov *.m4v);;MP4 파일 (*.mp4);;MOV 파일 (*.mov *.m4v);;모든 파일 (*.*)",
         )
         if not file_paths:
             return
 
         for file_path in file_paths:
+            if not is_supported_video_file(file_path):
+                self.log(f"지원하지 않는 영상 형식: {Path(file_path).name}")
+                continue
+
             duration_text = self._duration_text_for_video(file_path)
             target_row = self._first_empty_video_row()
             if target_row is None:
@@ -990,13 +1606,132 @@ class MainWindow(QMainWindow):
             == QMessageBox.Yes
         )
 
+    def export_selected_clip(self) -> None:
+        """현재 선택된 표 행의 원본 영상 구간을 개별 MP4 클립으로 저장합니다."""
+
+        selected_row = self.table.currentRow()
+        if selected_row < 0:
+            QMessageBox.information(self, "선택 장면 없음", "잘라 저장할 장면 행을 선택해 주세요.")
+            return
+
+        scene = self._scene_from_row(selected_row)
+        self._start_clip_export([scene], 1, "선택 장면 클립 저장")
+
+    def export_all_clips(self) -> None:
+        """video_path가 입력된 모든 표 행을 순서대로 개별 MP4 클립으로 저장합니다."""
+
+        scenes = [scene for scene in self._all_scenes() if scene.video_path.strip()]
+        if not scenes:
+            QMessageBox.information(self, "저장할 장면 없음", "video_path가 입력된 장면이 없습니다.")
+            return
+
+        self._start_clip_export(scenes, 1, "전체 장면 클립 저장")
+
+    def _subtitle_mask_options(self) -> tuple[str, int, int | None] | None:
+        """클립 저장에 사용할 기존 자막 가리기 옵션을 읽고 안내 메시지로 검증합니다."""
+
+        subtitle_mask_mode = self.subtitle_mask_mode_combo.currentText().strip() or SUBTITLE_MASK_NONE
+        subtitle_mask_height = self.subtitle_mask_height_spin.value()
+        subtitle_y_text = self.subtitle_mask_y_edit.text().strip()
+
+        if not 30 <= subtitle_mask_height <= 400:
+            QMessageBox.warning(self, "자막 영역 높이 확인", "자막 영역 높이는 30~400px 범위로 입력해 주세요.")
+            return None
+
+        subtitle_mask_y: int | None = None
+        if subtitle_y_text:
+            try:
+                subtitle_mask_y = int(subtitle_y_text)
+            except ValueError:
+                QMessageBox.warning(self, "자막 영역 시작 Y 확인", "자막 영역 시작 Y 위치는 숫자로 입력해 주세요.")
+                return None
+            if subtitle_mask_y < 0:
+                QMessageBox.warning(self, "자막 영역 시작 Y 확인", "자막 영역 시작 Y 위치는 0 이상의 숫자로 입력해 주세요.")
+                return None
+
+        if subtitle_mask_mode not in SUBTITLE_MASK_MODES:
+            QMessageBox.warning(self, "기존 자막 처리 방식 확인", "지원하지 않는 기존 자막 처리 방식입니다.")
+            return None
+
+        return subtitle_mask_mode, subtitle_mask_height, subtitle_mask_y
+
+    def _start_clip_export(self, scenes: list[Scene], start_index: int, title: str) -> None:
+        """클립 저장 작업을 별도 스레드에서 시작합니다."""
+
+        output_dir = self.clip_output_edit.text().strip()
+        if not output_dir:
+            self.choose_clip_output_dir()
+            output_dir = self.clip_output_edit.text().strip()
+        if not output_dir:
+            return
+
+        subtitle_mask_options = self._subtitle_mask_options()
+        if subtitle_mask_options is None:
+            return
+        subtitle_mask_mode, subtitle_mask_height, subtitle_mask_y = subtitle_mask_options
+
+        # ClipExportWorker가 실제 ffmpeg 실행 전 모든 입력값을 다시 검증합니다.
+        # 출력 폴더는 없으면 자동 생성되며, 한글 경로도 pathlib/리스트 인자로 그대로 전달합니다.
+        self._set_clip_buttons_enabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0% - 클립 저장 준비")
+        self.log(f"===== {title} 시작 =====")
+        if subtitle_mask_mode != SUBTITLE_MASK_NONE:
+            y_message = "하단 자동" if subtitle_mask_y is None else f"Y={subtitle_mask_y}px"
+            self.log(f"기존 자막 처리: {subtitle_mask_mode}, 높이={subtitle_mask_height}px, 시작={y_message}")
+
+        self.clip_worker_thread = QThread(self)
+        self.clip_worker = ClipExportWorker(
+            ffmpeg_path=self.ffmpeg_edit.text().strip(),
+            scenes=scenes,
+            output_dir=output_dir,
+            start_index=start_index,
+            subtitle_mask_mode=subtitle_mask_mode,
+            subtitle_mask_height=subtitle_mask_height,
+            subtitle_mask_y=subtitle_mask_y,
+        )
+        self.clip_worker.moveToThread(self.clip_worker_thread)
+
+        self.clip_worker_thread.started.connect(self.clip_worker.run)
+        self.clip_worker.log.connect(self.log)
+        self.clip_worker.progress.connect(self.update_progress)
+        self.clip_worker.finished.connect(self._clip_export_finished)
+        self.clip_worker.failed.connect(self._clip_export_failed)
+        self.clip_worker.finished.connect(self.clip_worker_thread.quit)
+        self.clip_worker.failed.connect(self.clip_worker_thread.quit)
+        self.clip_worker_thread.finished.connect(self.clip_worker_thread.deleteLater)
+        self.clip_worker_thread.start()
+
+    def _set_clip_buttons_enabled(self, enabled: bool) -> None:
+        """클립 저장 중 중복 실행을 막기 위해 관련 버튼 상태를 묶어서 바꿉니다."""
+
+        self.export_selected_clip_button.setEnabled(enabled)
+        self.export_all_clips_button.setEnabled(enabled)
+
+    def _clip_export_finished(self, output_dir: str) -> None:
+        self._set_clip_buttons_enabled(True)
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("100% - 클립 저장 완료")
+        self.log(f"클립 저장 완료 폴더: {output_dir}")
+        QMessageBox.information(self, "완료", f"클립 저장이 완료되었습니다.\n{output_dir}")
+        self.clip_worker = None
+        self.clip_worker_thread = None
+
+    def _clip_export_failed(self, error_message: str) -> None:
+        self._set_clip_buttons_enabled(True)
+        self.progress_bar.setFormat("클립 저장 오류")
+        self.log(f"클립 저장 오류: {error_message}")
+        QMessageBox.critical(self, "클립 저장 오류", error_message)
+        self.clip_worker = None
+        self.clip_worker_thread = None
+
     def export_video(self) -> None:
         """입력값을 검증하고 별도 스레드에서 최종 MP4 생성을 시작합니다."""
 
         scenes = [scene for scene in self._all_scenes() if scene.video_path.strip()]
         scenes, duration_warnings = self._fill_missing_end_times(scenes)
         if not scenes:
-            QMessageBox.warning(self, "장면 없음", "MP4 영상을 하나 이상 추가해 주세요.")
+            QMessageBox.warning(self, "장면 없음", "원본 영상을 하나 이상 추가해 주세요.")
             return
 
         output_path = self.output_edit.text().strip()
