@@ -123,6 +123,7 @@ class Project:
     ffmpeg_path: str = ""
     logo_path: str = ""
     music_path: str = ""
+    output_path: str = ""
     scenes: list[Scene] | None = None
     transition_mode: str = TRANSITION_CROSSFADE
     transition_duration: float = 0.7
@@ -140,6 +141,7 @@ class Project:
             ffmpeg_path=str(data.get("ffmpeg_path", "")),
             logo_path=str(data.get("logo_path", "")),
             music_path=str(data.get("music_path", "")),
+            output_path=str(data.get("output_path", "")),
             scenes=[Scene.from_dict(item) for item in data.get("scenes", [])],
             transition_mode=transition_mode,
             transition_duration=float(data.get("transition_duration", 0.7)),
@@ -154,6 +156,7 @@ class Project:
             "ffmpeg_path": self.ffmpeg_path,
             "logo_path": self.logo_path,
             "music_path": self.music_path,
+            "output_path": self.output_path,
             "scenes": [asdict(scene) for scene in self.scenes or []],
             "transition_mode": self.transition_mode,
             "transition_duration": self.transition_duration,
@@ -1013,6 +1016,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 980)
 
+        self.project_path: Path | None = None
         self.ffmpeg_edit = QLineEdit(find_default_ffmpeg())
         self.logo_edit = QLineEdit()
         self.music_edit = QLineEdit()
@@ -1145,15 +1149,18 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(project_box)
 
         save_button = QPushButton("프로젝트 저장")
+        save_as_button = QPushButton("다른 이름으로 저장")
         load_button = QPushButton("프로젝트 불러오기")
         project_layout.addWidget(save_button, 0, 0)
-        project_layout.addWidget(load_button, 0, 1)
+        project_layout.addWidget(save_as_button, 0, 1)
+        project_layout.addWidget(load_button, 1, 0, 1, 2)
 
         # Preview tools: the video area grows with the window and key range buttons stay visible.
-        preview_box = QGroupBox("영상 미리보기 / 구간 지정")
+        preview_box = QGroupBox("원본 클립 미리보기 / 구간 지정")
         preview_layout = QGridLayout(preview_box)
         right_layout.addWidget(preview_box, stretch=4)
 
+        self.preview_mode_label = QLabel("선택한 원본 클립의 구간을 확인합니다.")
         preview_play_button = QPushButton("재생")
         preview_pause_button = QPushButton("일시정지")
         preview_stop_button = QPushButton("정지")
@@ -1168,18 +1175,19 @@ class MainWindow(QMainWindow):
         self.preview_video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_slider.setRange(0, 0)
 
-        preview_layout.addWidget(self.preview_video_widget, 0, 0, 1, 6)
-        preview_layout.addWidget(preview_set_start_button, 1, 0, 1, 2)
-        preview_layout.addWidget(preview_set_end_button, 1, 2, 1, 2)
-        preview_layout.addWidget(preview_range_button, 1, 4, 1, 2)
-        preview_layout.addWidget(self.preview_time_label, 2, 0, 1, 6)
-        preview_layout.addWidget(self.preview_slider, 3, 0, 1, 6)
-        preview_layout.addWidget(preview_play_button, 4, 0)
-        preview_layout.addWidget(preview_pause_button, 4, 1)
-        preview_layout.addWidget(preview_stop_button, 4, 2)
-        preview_layout.addWidget(preview_back_button, 4, 3)
-        preview_layout.addWidget(preview_forward_button, 4, 4)
-        preview_layout.setRowStretch(0, 1)
+        preview_layout.addWidget(self.preview_mode_label, 0, 0, 1, 6)
+        preview_layout.addWidget(self.preview_video_widget, 1, 0, 1, 6)
+        preview_layout.addWidget(preview_set_start_button, 2, 0, 1, 2)
+        preview_layout.addWidget(preview_set_end_button, 2, 2, 1, 2)
+        preview_layout.addWidget(preview_range_button, 2, 4, 1, 2)
+        preview_layout.addWidget(self.preview_time_label, 3, 0, 1, 6)
+        preview_layout.addWidget(self.preview_slider, 4, 0, 1, 6)
+        preview_layout.addWidget(preview_play_button, 5, 0)
+        preview_layout.addWidget(preview_pause_button, 5, 1)
+        preview_layout.addWidget(preview_stop_button, 5, 2)
+        preview_layout.addWidget(preview_back_button, 5, 3)
+        preview_layout.addWidget(preview_forward_button, 5, 4)
+        preview_layout.setRowStretch(1, 1)
 
         # Final export: logo, music, destination path, and render command.
         final_box = QGroupBox("최종 홍보영상 만들기")
@@ -1189,6 +1197,7 @@ class MainWindow(QMainWindow):
         logo_button = QPushButton("회사 로고 PNG 선택")
         music_button = QPushButton("배경음악 MP3 선택")
         output_button = QPushButton("최종 영상 저장 위치 선택")
+        preview_final_button = QPushButton("최종 결과 미리보기")
         # 회사 홍보영상에서는 기본적으로 크로스페이드 0.7초가 자연스럽습니다.
         self.transition_mode_combo.addItems(TRANSITION_MODES)
         self.transition_mode_combo.setCurrentText(TRANSITION_CROSSFADE)
@@ -1222,7 +1231,8 @@ class MainWindow(QMainWindow):
         final_layout.addWidget(self.subtitle_enabled_checkbox, 5, 0, 1, 4)
         final_layout.addWidget(QLabel("시작/종료 페이드 시간"), 6, 0)
         final_layout.addWidget(self.edge_fade_duration_spin, 6, 1, 1, 3)
-        final_layout.addWidget(self.export_button, 7, 0, 1, 4)
+        final_layout.addWidget(preview_final_button, 7, 0, 1, 2)
+        final_layout.addWidget(self.export_button, 7, 2, 1, 2)
 
         # Progress and logs: keep status visible without taking space from the preview.
         progress_box = QGroupBox("진행률 / 로그")
@@ -1258,11 +1268,13 @@ class MainWindow(QMainWindow):
         up_button.clicked.connect(lambda: self.move_selected_scene(-1))
         down_button.clicked.connect(lambda: self.move_selected_scene(1))
         save_button.clicked.connect(self.save_project)
-        load_button.clicked.connect(self.load_project)
+        save_as_button.clicked.connect(self.save_project_as)
+        load_button.clicked.connect(lambda: self.load_project())
         template_button.clicked.connect(self.reset_template)
         self.export_selected_clip_button.clicked.connect(self.export_selected_clip)
         self.export_all_clips_button.clicked.connect(self.export_all_clips)
         self.export_button.clicked.connect(self.export_video)
+        preview_final_button.clicked.connect(self.preview_final_output)
         preview_play_button.clicked.connect(self.preview_player.play)
         preview_pause_button.clicked.connect(self.preview_player.pause)
         preview_stop_button.clicked.connect(self._stop_preview)
@@ -1376,6 +1388,7 @@ class MainWindow(QMainWindow):
             self.preview_player.setSource(QUrl.fromLocalFile(video_path))
             self.preview_slider.setValue(0)
             self.preview_time_label.setText("00:00:00 / 00:00:00")
+            self.preview_mode_label.setText("선택한 원본 클립의 구간을 확인합니다.")
             self.log(f"미리보기 영상 로드: {video_path}")
 
         start_text = scene.start_time.strip() or "00:00:00"
@@ -1683,22 +1696,14 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.Yes:
             self._load_default_template()
 
-    def save_project(self) -> None:
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "프로젝트 JSON 저장",
-            str(Path.cwd() / "marineglory_project.json"),
-            "JSON 파일 (*.json)",
-        )
-        if not file_path:
-            return
-        if not file_path.lower().endswith(".json"):
-            file_path += ".json"
+    def _project_from_ui(self) -> Project:
+        """현재 GUI 입력값을 프로젝트 저장 모델로 변환합니다."""
 
-        project = Project(
+        return Project(
             ffmpeg_path=self.ffmpeg_edit.text().strip(),
             logo_path=self.logo_edit.text().strip(),
             music_path=self.music_edit.text().strip(),
+            output_path=self.output_edit.text().strip(),
             scenes=self._all_scenes(),
             transition_mode=self.transition_mode_combo.currentText(),
             transition_duration=self.transition_duration_spin.value(),
@@ -1707,27 +1712,59 @@ class MainWindow(QMainWindow):
             edge_fade_duration=self.edge_fade_duration_spin.value(),
             subtitle_enabled=self.subtitle_enabled_checkbox.isChecked(),
         )
-        Path(file_path).write_text(
-            json.dumps(project.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        self.log(f"프로젝트 저장 완료: {file_path}")
 
-    def load_project(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
+    def save_project(self) -> None:
+        if self.project_path is None:
+            self.save_project_as()
+            return
+
+        self._write_project(self.project_path)
+
+    def save_project_as(self) -> None:
+        file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "프로젝트 JSON 불러오기",
-            str(Path.cwd()),
-            "JSON 파일 (*.json);;모든 파일 (*.*)",
+            "프로젝트 JSON 저장",
+            str(self.project_path or Path.cwd() / "marineglory_project.json"),
+            "JSON 파일 (*.json)",
         )
         if not file_path:
             return
+        path = Path(file_path)
+        if path.suffix.lower() != ".json":
+            path = path.with_suffix(".json")
+        self.project_path = path
+        self._write_project(path)
 
-        data = json.loads(Path(file_path).read_text(encoding="utf-8"))
+    def _write_project(self, path: Path) -> None:
+        project = self._project_from_ui()
+        path.write_text(
+            json.dumps(project.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.project_path = path
+        self.log(f"프로젝트 저장 완료: {path}")
+
+    def load_project(self, file_path: str | Path | None = None) -> None:
+        if file_path is None:
+            selected_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "프로젝트 JSON 불러오기",
+                str(Path.cwd()),
+                "JSON 파일 (*.json);;모든 파일 (*.*)",
+            )
+            if not selected_path:
+                return
+            path = Path(selected_path)
+        else:
+            path = Path(file_path)
+
+        data = json.loads(path.read_text(encoding="utf-8"))
         project = Project.from_dict(data)
         self.ffmpeg_edit.setText(project.ffmpeg_path)
         self.logo_edit.setText(project.logo_path)
         self.music_edit.setText(project.music_path)
+        if project.output_path:
+            self.output_edit.setText(project.output_path)
         self.transition_mode_combo.setCurrentText(project.transition_mode)
         self.transition_duration_spin.setValue(project.transition_duration)
         self.fade_in_checkbox.setChecked(project.fade_in_enabled)
@@ -1735,7 +1772,8 @@ class MainWindow(QMainWindow):
         self.edge_fade_duration_spin.setValue(project.edge_fade_duration)
         self.subtitle_enabled_checkbox.setChecked(project.subtitle_enabled)
         self._set_scenes(project.scenes or [])
-        self.log(f"프로젝트 불러오기 완료: {file_path}")
+        self.project_path = path
+        self.log(f"프로젝트 불러오기 완료: {path}")
 
     def _validate_before_export(
         self,
@@ -2039,6 +2077,28 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
 
+    def preview_final_output(self) -> None:
+        """최종 생성된 MP4를 같은 미리보기 플레이어에 로드하고 재생합니다."""
+
+        output_path = self.output_edit.text().strip()
+        if not output_path:
+            QMessageBox.information(self, "최종 결과 미리보기", "먼저 최종 MP4를 생성해 주세요.")
+            return
+
+        path = Path(output_path)
+        if not path.exists():
+            QMessageBox.information(self, "최종 결과 미리보기", "먼저 최종 MP4를 생성해 주세요.")
+            self.log(f"최종 결과 미리보기 실패: 파일 없음 - {path}")
+            return
+
+        self.preview_stop_at_ms = None
+        self.preview_current_path = str(path)
+        self.preview_mode_label.setText("최종 결과 미리보기: 자막/로고/BGM/전환 효과가 적용된 MP4입니다.")
+        self.preview_player.setSource(QUrl.fromLocalFile(str(path)))
+        self.preview_slider.setValue(0)
+        self.preview_player.play()
+        self.log(f"최종 결과 미리보기 로드: {path}")
+
     def update_progress(self, percent: int, message: str) -> None:
         """export 진행률을 장면 단위로 보기 쉽게 표시합니다."""
 
@@ -2052,6 +2112,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("100% - 완료")
         self.log(f"완료: {output_path}")
+        self.output_edit.setText(output_path)
+        self.preview_final_output()
         QMessageBox.information(self, "완료", f"최종 MP4 생성이 완료되었습니다.\n{output_path}")
         self.worker = None
         self.worker_thread = None
@@ -2065,15 +2127,25 @@ class MainWindow(QMainWindow):
         self.worker_thread = None
 
 
-def main() -> int:
+def main(project_file: str | None = None) -> int:
     """Qt 애플리케이션 진입점입니다."""
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     window = MainWindow()
+    if project_file:
+        try:
+            window.load_project(project_file)
+        except Exception as exc:
+            window.log(f"시작 프로젝트 자동 불러오기 실패: {project_file} - {exc}")
+            QMessageBox.warning(
+                window,
+                "프로젝트 자동 불러오기 실패",
+                f"프로젝트를 자동으로 불러오지 못했습니다.\n{project_file}\n\n수동으로 불러올 수 있습니다.",
+            )
     window.show()
     return app.exec()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1] if len(sys.argv) > 1 else None))

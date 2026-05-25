@@ -126,12 +126,14 @@ class SceneEditorWindow(QMainWindow):
         self.open_button = QPushButton("프로젝트 열기")
         self.save_button = QPushButton("저장")
         self.generate_button = QPushButton("전체 영상 생성")
+        self.preview_output_button = QPushButton("전체 결과 미리보기")
         self.path_label = QLabel("프로젝트가 열리지 않았습니다.")
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.path_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(self.open_button)
         toolbar.addWidget(self.save_button)
         toolbar.addWidget(self.generate_button)
+        toolbar.addWidget(self.preview_output_button)
         toolbar.addWidget(self.path_label)
         root.addLayout(toolbar)
 
@@ -256,6 +258,7 @@ class SceneEditorWindow(QMainWindow):
         self.open_button.clicked.connect(self.choose_project)
         self.save_button.clicked.connect(self.save_project)
         self.generate_button.clicked.connect(self.run_main_py)
+        self.preview_output_button.clicked.connect(self.preview_full_output)
         self.scene_list.currentRowChanged.connect(self.select_scene)
         self.play_button.clicked.connect(self.play_preview)
         self.stop_button.clicked.connect(self.media_player.stop)
@@ -414,6 +417,17 @@ class SceneEditorWindow(QMainWindow):
         base_dir = self.project_path.parent if self.project_path else app_dir()
         return base_dir / path
 
+    def resolve_output_path(self) -> Path:
+        output_path = str(self.project_data.get("output_path", "")).strip()
+        if output_path:
+            path = Path(output_path)
+            if path.is_absolute():
+                return path
+            base_dir = self.project_path.parent if self.project_path else app_dir()
+            return base_dir / path
+        base_dir = self.project_path.parent if self.project_path else app_dir()
+        return base_dir / "marineglory_promo.mp4"
+
     def _update_preview_source(self, show_missing_message: bool = False) -> None:
         clip_path = self.clip_path_edit.text().strip()
         self.preview_path_label.setText(clip_path or "클립 파일 경로가 비어 있습니다.")
@@ -461,9 +475,25 @@ class SceneEditorWindow(QMainWindow):
         if not path.exists():
             QMessageBox.warning(self, "미리보기", f"파일을 찾을 수 없습니다.\n{path}")
             return
-        if self.media_player.source().isEmpty():
+        if self.media_player.source().isEmpty() or self.loaded_preview_path != path:
             self.media_player.setSource(QUrl.fromLocalFile(str(path)))
             self.loaded_preview_path = path
+        self.media_player.play()
+
+    def preview_full_output(self) -> None:
+        path = self.resolve_output_path()
+        if not path.exists():
+            QMessageBox.information(
+                self,
+                "전체 결과 미리보기",
+                "아직 최종 영상이 생성되지 않았습니다. 전체 영상 생성 후 다시 확인해 주세요.",
+            )
+            return
+
+        self.loaded_preview_path = path
+        self.preview_path_label.setText(f"전체 결과 미리보기\n실제 경로: {path}")
+        self.media_player.stop()
+        self.media_player.setSource(QUrl.fromLocalFile(str(path)))
         self.media_player.play()
 
     def seek_relative(self, milliseconds: int) -> None:
@@ -544,14 +574,19 @@ class SceneEditorWindow(QMainWindow):
 
     def run_main_py(self) -> None:
         self.apply_editor_to_scene()
-        if self.project_path is not None and not self._write_project(self.project_path):
+        if self.project_path is None:
+            self.save_project()
+            if self.project_path is None:
+                return
+        if not self._write_project(self.project_path):
             return
+        project_arg = self.project_path
         main_path = app_dir() / "main.py"
         if not main_path.exists():
             QMessageBox.critical(self, "실행 실패", f"main.py를 찾을 수 없습니다.\n{main_path}")
             return
         try:
-            subprocess.Popen([sys.executable, str(main_path)], cwd=str(app_dir()))
+            subprocess.Popen([sys.executable, str(main_path), str(project_arg)], cwd=str(app_dir()))
         except Exception as exc:
             QMessageBox.critical(self, "실행 실패", str(exc))
 
