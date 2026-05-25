@@ -14,6 +14,7 @@ python main.py
 
 ```powershell
 python main.py marineglory_project.json
+python video_editor_ui.py marineglory_project.json
 ```
 
 씬별 자막과 클립 경로를 먼저 편집하려면 별도 편집 UI를 실행할 수 있습니다.
@@ -22,7 +23,7 @@ python main.py marineglory_project.json
 python video_editor_ui.py
 ```
 
-`프로젝트 열기`로 `marineglory_project.json`을 불러온 뒤 왼쪽 씬 목록, 중앙 미리보기, 오른쪽 속성 패널, 하단 타임라인에서 장면 정보를 확인하고 수정합니다. `저장`은 현재 JSON에 다시 저장하고, `전체 영상 생성`은 기존 `main.py` 프로그램을 실행합니다.
+`프로젝트 열기`로 `marineglory_project.json`을 불러온 뒤 왼쪽 씬 목록, 중앙 미리보기, 오른쪽 속성 패널, 하단 타임라인에서 장면 정보를 확인하고 수정합니다. `저장`은 현재 JSON에 다시 저장하고, `제작 화면 열기`는 기존 `main.py` 프로그램을 같은 프로젝트 경로로 실행합니다.
 
 ### 씬 편집 UI 2차 개선
 
@@ -32,15 +33,23 @@ python video_editor_ui.py
 
 ### 3차 개선: 프로젝트 연계와 결과 미리보기
 
-`main.py`에서 프로젝트를 저장하면 최종 출력 MP4 경로도 JSON의 `output_path`에 함께 저장됩니다. 저장한 프로젝트를 `video_editor_ui.py`에서 열어 씬별 자막과 구간을 다듬은 뒤 `전체 영상 생성`을 누르면 현재 JSON을 저장하고 `main.py`를 해당 프로젝트 경로와 함께 실행합니다.
+`main.py`에서 프로젝트를 저장하면 최종 출력 MP4 경로도 JSON의 `output_path`에 함께 저장됩니다. 저장한 프로젝트를 `video_editor_ui.py`에서 열어 씬별 자막과 구간을 다듬은 뒤 `제작 화면 열기`를 누르면 현재 JSON을 저장하고 `main.py`를 해당 프로젝트 경로와 함께 실행합니다. 반대로 `main.py`의 `씬 편집 화면 열기`를 누르면 현재 UI 입력값을 JSON에 저장한 뒤 `video_editor_ui.py`를 같은 프로젝트 경로로 실행합니다.
 
 권장 작업 흐름은 아래 순서입니다.
 
 1. `main.py`에서 원본 영상을 추가하고 프로젝트를 저장합니다.
-2. `video_editor_ui.py`에서 씬별 자막, 시작/종료 시간, 클립 순서를 편집합니다.
-3. `전체 영상 생성`으로 `main.py`를 열고 최종 MP4를 생성합니다.
+2. `씬 편집 화면 열기`로 `video_editor_ui.py`를 열어 씬별 자막, 시작/종료 시간, 클립 순서를 편집합니다.
+3. `제작 화면 열기`로 `main.py`를 다시 열고 최종 MP4를 생성합니다.
 4. `main.py` 또는 `video_editor_ui.py`의 `전체 결과 미리보기`로 자막/로고/BGM/전환 효과가 적용된 영상을 확인합니다.
 5. 필요한 부분을 다시 수정한 뒤 저장하고 재생성합니다.
+
+두 화면은 같은 `marineglory_project.json`을 공유합니다. 화면을 오갈 때 버튼이 먼저 현재 내용을 저장하므로, 한쪽에서 수정한 프로젝트를 다른 쪽에서 이어서 다룰 수 있습니다.
+
+### 4차 개선: 전환 미리보기
+
+`video_editor_ui.py`에서 씬을 선택한 뒤 `전환 미리보기 생성`을 누르면 선택 씬의 마지막 약 2초와 다음 씬의 처음 약 2초를 이용해 짧은 MP4를 만듭니다. 현재 프로젝트의 `transition_mode`, `transition_duration`을 적용하며, `없음`은 단순 컷 연결, `크로스페이드`와 `페이드 투 블랙`은 ffmpeg 전환 처리로 확인합니다.
+
+생성 파일은 프로젝트 폴더의 `preview/transition_preview.mp4`에 저장되고, 생성 후 중앙 미리보기 플레이어에서 자동 재생됩니다. 마지막 씬을 선택한 경우에는 다음 씬이 없어 전환 미리보기를 만들 수 없다는 안내가 표시됩니다.
 
 ## ffmpeg.exe 준비
 

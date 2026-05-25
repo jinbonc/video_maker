@@ -1,7 +1,8 @@
 {
   "ffmpeg_path": "C:\\ffmpeg-2026-05-21-git-0857141823-essentials_build\\bin\\ffmpeg.EXE",
-  "logo_path": "",
+  "logo_path": "C:/Users/Caros/Downloads/marine_glory_logo_transparent.png",
   "music_path": "",
+  "output_path": "C:\\VisualJinGif\\CodexProject\\video-maker\\marineglory_promo.mp4",
   "scenes": [
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/01_항만 전경.mp4",
@@ -11,32 +12,32 @@
       "subtitle": "안전한 항만 물류의 시작"
     },
     {
-      "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/01_선박 접안.mp4",
+      "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/02_선박 접안.mp4",
       "scene_name": "선박 접안",
       "start_time": "00:00:00",
-      "end_time": "00:00:04.840",
+      "end_time": "00:00:06.440",
       "subtitle": "마린글로리 소금 하역 운영"
     },
     {
-      "video_path": "",
-      "scene_name": "TBM 회의",
+      "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/03_초기작업1.mp4",
+      "scene_name": "초기작업",
       "start_time": "00:00:00",
-      "end_time": "",
-      "subtitle": "작업 전 위험요인 공유"
+      "end_time": "00:00:13.220",
+      "subtitle": "초기 하역작업"
     },
     {
-      "video_path": "",
-      "scene_name": "안전 준비",
+      "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/04_초기작업2.mp4",
+      "scene_name": "초기작업2",
       "start_time": "00:00:00",
-      "end_time": "",
-      "subtitle": "기본을 지키는 안전문화"
+      "end_time": "00:00:15.100",
+      "subtitle": "초기 하역작업"
     },
     {
-      "video_path": "",
-      "scene_name": "본선 하역",
+      "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/05_초기작업3.mp4",
+      "scene_name": "초기작업3",
       "start_time": "00:00:00",
-      "end_time": "",
-      "subtitle": "체계적인 본선 하역"
+      "end_time": "00:00:41.350",
+      "subtitle": "초기 하역작업"
     },
     {
       "video_path": "",
@@ -73,5 +74,11 @@
       "end_time": "",
       "subtitle": "안전과 신뢰로 완성하는 하역 작업"
     }
-  ]
+  ],
+  "transition_mode": "크로스페이드",
+  "transition_duration": 0.7,
+  "fade_in_enabled": true,
+  "fade_out_enabled": true,
+  "edge_fade_duration": 1.0,
+  "subtitle_enabled": false
 }

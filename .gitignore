@@ -4,6 +4,7 @@ dist/
 clips/
 output/
 _internal/
+file-backups/
 *.exe
 *.log
 *.tmp

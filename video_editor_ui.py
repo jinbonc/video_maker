@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import main as video_maker
 from PySide6.QtCore import QSize, Qt, QUrl
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -93,7 +94,7 @@ def format_duration(start_time: str, end_time: str) -> str:
 
 
 class SceneEditorWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, project_file: str | Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(1320, 780)
@@ -112,7 +113,16 @@ class SceneEditorWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
 
-        if default_project_path().exists():
+        if project_file is not None:
+            try:
+                self.load_project(Path(project_file))
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "프로젝트 자동 불러오기 실패",
+                    f"프로젝트를 자동으로 불러오지 못했습니다.\n{project_file}\n\n수동으로 열 수 있습니다.\n\n{exc}",
+                )
+        elif default_project_path().exists():
             self.load_project(default_project_path())
 
     def _build_ui(self) -> None:
@@ -125,8 +135,9 @@ class SceneEditorWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.open_button = QPushButton("프로젝트 열기")
         self.save_button = QPushButton("저장")
-        self.generate_button = QPushButton("전체 영상 생성")
+        self.generate_button = QPushButton("제작 화면 열기")
         self.preview_output_button = QPushButton("전체 결과 미리보기")
+        self.transition_preview_button = QPushButton("전환 미리보기 생성")
         self.path_label = QLabel("프로젝트가 열리지 않았습니다.")
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.path_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -134,6 +145,7 @@ class SceneEditorWindow(QMainWindow):
         toolbar.addWidget(self.save_button)
         toolbar.addWidget(self.generate_button)
         toolbar.addWidget(self.preview_output_button)
+        toolbar.addWidget(self.transition_preview_button)
         toolbar.addWidget(self.path_label)
         root.addLayout(toolbar)
 
@@ -259,6 +271,7 @@ class SceneEditorWindow(QMainWindow):
         self.save_button.clicked.connect(self.save_project)
         self.generate_button.clicked.connect(self.run_main_py)
         self.preview_output_button.clicked.connect(self.preview_full_output)
+        self.transition_preview_button.clicked.connect(self.create_transition_preview)
         self.scene_list.currentRowChanged.connect(self.select_scene)
         self.play_button.clicked.connect(self.play_preview)
         self.stop_button.clicked.connect(self.media_player.stop)
@@ -496,6 +509,51 @@ class SceneEditorWindow(QMainWindow):
         self.media_player.setSource(QUrl.fromLocalFile(str(path)))
         self.media_player.play()
 
+    def create_transition_preview(self) -> None:
+        row = self.current_scene_index
+        if row < 0:
+            QMessageBox.information(self, "전환 미리보기", "전환을 확인할 씬을 선택해 주세요.")
+            return
+        if row >= len(self.scenes) - 1:
+            QMessageBox.information(
+                self,
+                "전환 미리보기",
+                "다음 씬이 없어 전환 미리보기를 만들 수 없습니다.",
+            )
+            return
+
+        self.apply_editor_to_scene()
+        if self.project_path is None:
+            self.save_project()
+            if self.project_path is None:
+                return
+        if not self._write_project(self.project_path):
+            return
+
+        output_path = self.project_path.parent / "preview" / "transition_preview.mp4"
+        self.transition_preview_button.setEnabled(False)
+        self.preview_path_label.setText("전환 미리보기 생성 중...")
+        QApplication.processEvents()
+        try:
+            rendered_path = video_maker.render_transition_preview(
+                self.project_path,
+                row,
+                output_path,
+                log_callback=lambda message: self.preview_path_label.setText(message),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "전환 미리보기 실패", str(exc))
+            self.preview_path_label.setText("전환 미리보기 생성 실패")
+            return
+        finally:
+            self.transition_preview_button.setEnabled(True)
+
+        self.loaded_preview_path = rendered_path
+        self.preview_path_label.setText(f"전환 미리보기\n실제 경로: {rendered_path}")
+        self.media_player.stop()
+        self.media_player.setSource(QUrl.fromLocalFile(str(rendered_path)))
+        self.media_player.play()
+
     def seek_relative(self, milliseconds: int) -> None:
         duration = max(0, self.media_player.duration())
         next_position = self.media_player.position() + milliseconds
@@ -588,16 +646,16 @@ class SceneEditorWindow(QMainWindow):
         try:
             subprocess.Popen([sys.executable, str(main_path), str(project_arg)], cwd=str(app_dir()))
         except Exception as exc:
-            QMessageBox.critical(self, "실행 실패", str(exc))
+            QMessageBox.critical(self, "제작 화면 열기 실패", str(exc))
 
 
-def main() -> int:
+def main(project_file: str | None = None) -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    window = SceneEditorWindow()
+    window = SceneEditorWindow(project_file)
     window.show()
     return app.exec()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1] if len(sys.argv) > 1 else None))

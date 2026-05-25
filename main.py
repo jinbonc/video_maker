@@ -788,6 +788,111 @@ class ExportWorker(QObject):
         shutil.copy2(video_path, self.output_path)
 
 
+def _preview_scene_slice(scene: Scene, use_tail: bool, seconds: float = 2.0) -> tuple[Scene, float]:
+    """전환 확인용으로 장면의 마지막/처음 일부 구간을 잘라낸 Scene을 만듭니다."""
+
+    start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
+    end_seconds = parse_time_to_seconds(scene.end_time.strip())
+    if end_seconds <= start_seconds:
+        raise ValueError(f"장면 시간이 올바르지 않습니다: {scene.scene_name or scene.video_path}")
+
+    if use_tail:
+        slice_start = max(start_seconds, end_seconds - seconds)
+        slice_end = end_seconds
+    else:
+        slice_start = start_seconds
+        slice_end = min(end_seconds, start_seconds + seconds)
+
+    sliced_scene = Scene(
+        video_path=scene.video_path,
+        scene_name=scene.scene_name,
+        start_time=format_seconds_for_display(slice_start),
+        end_time=format_seconds_for_display(slice_end),
+        subtitle=scene.subtitle,
+    )
+    return sliced_scene, slice_end - slice_start
+
+
+def render_transition_preview(
+    project_path: str | Path,
+    scene_index: int,
+    output_path: str | Path,
+    log_callback: Any | None = None,
+) -> Path:
+    """
+    선택 장면과 다음 장면의 짧은 구간만 렌더링해 전환 효과를 확인하는 MP4를 만듭니다.
+
+    전체 export와 같은 ExportWorker 렌더/병합 helper를 재사용하되, 배경음악 믹스는 생략합니다.
+    """
+
+    project_file = Path(project_path)
+    data = json.loads(project_file.read_text(encoding="utf-8"))
+    project = Project.from_dict(data)
+    scenes = project.scenes or []
+    if scene_index < 0 or scene_index >= len(scenes) - 1:
+        raise ValueError("다음 씬이 없어 전환 미리보기를 만들 수 없습니다.")
+
+    ffmpeg_path = project.ffmpeg_path or find_default_ffmpeg()
+    if not ffmpeg_path or not Path(ffmpeg_path).exists():
+        raise FileNotFoundError("ffmpeg.exe 경로가 없습니다. main.py에서 ffmpeg 경로를 지정해 저장해 주세요.")
+
+    project_dir = project_file.resolve().parent
+    selected_scene = scenes[scene_index]
+    next_scene = scenes[scene_index + 1]
+    selected_scene.video_path = str((project_dir / selected_scene.video_path).resolve()) if selected_scene.video_path and not Path(selected_scene.video_path).is_absolute() else selected_scene.video_path
+    next_scene.video_path = str((project_dir / next_scene.video_path).resolve()) if next_scene.video_path and not Path(next_scene.video_path).is_absolute() else next_scene.video_path
+    if project.logo_path and not Path(project.logo_path).is_absolute():
+        project.logo_path = str((project_dir / project.logo_path).resolve())
+
+    for scene in (selected_scene, next_scene):
+        if not scene.video_path or not Path(scene.video_path).exists():
+            raise FileNotFoundError(f"전환 미리보기용 클립 파일을 찾을 수 없습니다: {scene.video_path}")
+        if not scene.end_time.strip():
+            raise ValueError(f"전환 미리보기를 만들려면 종료 시간이 필요합니다: {scene.scene_name or scene.video_path}")
+
+    preview_scenes_and_durations = [
+        _preview_scene_slice(selected_scene, use_tail=True),
+        _preview_scene_slice(next_scene, use_tail=False),
+    ]
+    preview_scenes = [item[0] for item in preview_scenes_and_durations]
+    preview_durations = [item[1] for item in preview_scenes_and_durations]
+    transition_duration = project.transition_duration
+    if project.transition_mode in (TRANSITION_CROSSFADE, TRANSITION_FADE_BLACK):
+        shortest = min(preview_durations)
+        if transition_duration <= 0 or transition_duration >= shortest:
+            raise ValueError(
+                "전환 시간이 미리보기 구간보다 깁니다. 전환 시간을 2초보다 짧게 조정해 주세요."
+            )
+
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="marineglory_transition_preview_") as temp_dir:
+        temp_path = Path(temp_dir)
+        worker = ExportWorker(
+            ffmpeg_path=ffmpeg_path,
+            scenes=preview_scenes,
+            logo_path=project.logo_path,
+            music_path="",
+            output_path=str(output_file),
+            transition_mode=project.transition_mode,
+            transition_duration=transition_duration,
+            fade_in_enabled=False,
+            fade_out_enabled=False,
+            edge_fade_duration=project.edge_fade_duration,
+            subtitle_enabled=project.subtitle_enabled,
+        )
+        if log_callback is not None:
+            worker.log.connect(log_callback)
+        clips = [
+            worker._render_scene(scene, index, temp_path, duration)
+            for index, (scene, duration) in enumerate(zip(preview_scenes, preview_durations), start=1)
+        ]
+        worker._merge_rendered_clips(clips, preview_durations, output_file, temp_path)
+
+    return output_file
+
+
 class ClipExportWorker(QObject):
     """원본 영상의 지정 구간만 잘라 개별 MP4 클립으로 저장하는 작업자입니다."""
 
@@ -1151,9 +1256,11 @@ class MainWindow(QMainWindow):
         save_button = QPushButton("프로젝트 저장")
         save_as_button = QPushButton("다른 이름으로 저장")
         load_button = QPushButton("프로젝트 불러오기")
+        open_scene_editor_button = QPushButton("씬 편집 화면 열기")
         project_layout.addWidget(save_button, 0, 0)
         project_layout.addWidget(save_as_button, 0, 1)
         project_layout.addWidget(load_button, 1, 0, 1, 2)
+        project_layout.addWidget(open_scene_editor_button, 2, 0, 1, 2)
 
         # Preview tools: the video area grows with the window and key range buttons stay visible.
         preview_box = QGroupBox("원본 클립 미리보기 / 구간 지정")
@@ -1270,6 +1377,7 @@ class MainWindow(QMainWindow):
         save_button.clicked.connect(self.save_project)
         save_as_button.clicked.connect(self.save_project_as)
         load_button.clicked.connect(lambda: self.load_project())
+        open_scene_editor_button.clicked.connect(self.open_scene_editor)
         template_button.clicked.connect(self.reset_template)
         self.export_selected_clip_button.clicked.connect(self.export_selected_clip)
         self.export_all_clips_button.clicked.connect(self.export_all_clips)
@@ -1743,6 +1851,34 @@ class MainWindow(QMainWindow):
         )
         self.project_path = path
         self.log(f"프로젝트 저장 완료: {path}")
+
+    def open_scene_editor(self) -> None:
+        """현재 프로젝트를 저장한 뒤 씬 편집 전용 UI를 같은 JSON 경로로 엽니다."""
+
+        if self.project_path is None:
+            self.save_project_as()
+            if self.project_path is None:
+                return
+        else:
+            self._write_project(self.project_path)
+
+        editor_path = application_dir() / "video_editor_ui.py"
+        if not editor_path.exists():
+            QMessageBox.critical(
+                self,
+                "씬 편집 화면 열기 실패",
+                f"video_editor_ui.py를 찾을 수 없습니다.\n{editor_path}",
+            )
+            return
+
+        try:
+            subprocess.Popen(
+                [sys.executable, str(editor_path), str(self.project_path)],
+                cwd=str(application_dir()),
+            )
+            self.log(f"씬 편집 화면 열기: {self.project_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "씬 편집 화면 열기 실패", str(exc))
 
     def load_project(self, file_path: str | Path | None = None) -> None:
         if file_path is None:
