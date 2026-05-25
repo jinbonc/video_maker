@@ -5,10 +5,24 @@ PySide6 GUI와 `ffmpeg.exe`를 이용해 여러 MP4 현장 영상을 자르고, 
 ## 실행 준비
 
 ```powershell
-cd "D:\Codex Project\VIDEO_TOOL"
+cd "C:\VisualJinGif\CodexProject\video-maker"
 pip install -r requirements.txt
 python main.py
 ```
+
+씬별 자막과 클립 경로를 먼저 편집하려면 별도 편집 UI를 실행할 수 있습니다.
+
+```powershell
+python video_editor_ui.py
+```
+
+`프로젝트 열기`로 `marineglory_project.json`을 불러온 뒤 왼쪽 씬 목록, 중앙 미리보기, 오른쪽 속성 패널, 하단 타임라인에서 장면 정보를 확인하고 수정합니다. `저장`은 현재 JSON에 다시 저장하고, `전체 영상 생성`은 기존 `main.py` 프로그램을 실행합니다.
+
+### 씬 편집 UI 2차 개선
+
+`video_editor_ui.py`의 미리보기 영역에서는 재생 슬라이더와 현재 시간/전체 시간을 확인할 수 있습니다. 슬라이더를 움직이면 영상 위치가 이동하고, `1초 뒤로`, `1초 앞으로` 버튼으로 세밀하게 위치를 조절할 수 있습니다.
+
+자막 타이밍을 맞출 때는 영상을 원하는 위치에 멈춘 뒤 `현재 위치를 자막 시작 시간으로` 또는 `현재 위치를 자막 종료 시간으로`를 누르면 `HH:MM:SS.mmm` 형식으로 입력됩니다. JSON에 `clips/01_test.mp4` 같은 상대 경로가 들어 있으면 프로젝트 JSON 파일이 있는 폴더 기준으로 실제 클립을 찾습니다.
 
 ## ffmpeg.exe 준비
 
