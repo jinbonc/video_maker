@@ -31,7 +31,9 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -59,6 +61,10 @@ OUTPUT_WIDTH = 1920
 OUTPUT_HEIGHT = 1080
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
+TRANSITION_NONE = "없음"
+TRANSITION_CROSSFADE = "크로스페이드"
+TRANSITION_FADE_BLACK = "페이드 투 블랙"
+TRANSITION_MODES = [TRANSITION_NONE, TRANSITION_CROSSFADE, TRANSITION_FADE_BLACK]
 SUBTITLE_MASK_NONE = "없음"
 SUBTITLE_MASK_CROP = "하단 크롭"
 SUBTITLE_MASK_BLUR = "하단 블러"
@@ -118,14 +124,29 @@ class Project:
     logo_path: str = ""
     music_path: str = ""
     scenes: list[Scene] | None = None
+    transition_mode: str = TRANSITION_CROSSFADE
+    transition_duration: float = 0.7
+    fade_in_enabled: bool = True
+    fade_out_enabled: bool = True
+    edge_fade_duration: float = 1.0
+    subtitle_enabled: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Project":
+        transition_mode = str(data.get("transition_mode", TRANSITION_CROSSFADE))
+        if transition_mode not in TRANSITION_MODES:
+            transition_mode = TRANSITION_CROSSFADE
         return cls(
             ffmpeg_path=str(data.get("ffmpeg_path", "")),
             logo_path=str(data.get("logo_path", "")),
             music_path=str(data.get("music_path", "")),
             scenes=[Scene.from_dict(item) for item in data.get("scenes", [])],
+            transition_mode=transition_mode,
+            transition_duration=float(data.get("transition_duration", 0.7)),
+            fade_in_enabled=bool(data.get("fade_in_enabled", True)),
+            fade_out_enabled=bool(data.get("fade_out_enabled", True)),
+            edge_fade_duration=float(data.get("edge_fade_duration", 1.0)),
+            subtitle_enabled=bool(data.get("subtitle_enabled", True)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -134,6 +155,12 @@ class Project:
             "logo_path": self.logo_path,
             "music_path": self.music_path,
             "scenes": [asdict(scene) for scene in self.scenes or []],
+            "transition_mode": self.transition_mode,
+            "transition_duration": self.transition_duration,
+            "fade_in_enabled": self.fade_in_enabled,
+            "fade_out_enabled": self.fade_out_enabled,
+            "edge_fade_duration": self.edge_fade_duration,
+            "subtitle_enabled": self.subtitle_enabled,
         }
 
 
@@ -417,6 +444,12 @@ class ExportWorker(QObject):
         logo_path: str,
         music_path: str,
         output_path: str,
+        transition_mode: str = TRANSITION_CROSSFADE,
+        transition_duration: float = 0.7,
+        fade_in_enabled: bool = True,
+        fade_out_enabled: bool = True,
+        edge_fade_duration: float = 1.0,
+        subtitle_enabled: bool = True,
     ) -> None:
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -424,6 +457,12 @@ class ExportWorker(QObject):
         self.logo_path = logo_path
         self.music_path = music_path
         self.output_path = output_path
+        self.transition_mode = transition_mode
+        self.transition_duration = transition_duration
+        self.fade_in_enabled = fade_in_enabled
+        self.fade_out_enabled = fade_out_enabled
+        self.edge_fade_duration = edge_fade_duration
+        self.subtitle_enabled = subtitle_enabled
 
     def run(self) -> None:
         """전체 export 절차: 장면별 렌더링 -> concat -> 음악 믹스."""
@@ -433,17 +472,22 @@ class ExportWorker(QObject):
             with tempfile.TemporaryDirectory(prefix="marineglory_") as temp_dir:
                 temp_path = Path(temp_dir)
                 rendered_clips: list[Path] = []
+                clip_durations: list[float] = []
 
                 for index, scene in enumerate(self.scenes, start=1):
                     percent = int(((index - 1) / len(self.scenes)) * 80)
                     label = f"[{index}/{len(self.scenes)}] 임시 클립 생성: {scene.scene_name}"
                     self.progress.emit(percent, label)
                     self.log.emit(label)
-                    rendered_clips.append(self._render_scene(scene, index, temp_path))
+                    duration_seconds = self._scene_duration_seconds(scene)
+                    clip_durations.append(duration_seconds)
+                    rendered_clips.append(
+                        self._render_scene(scene, index, temp_path, duration_seconds)
+                    )
 
                 concat_output = temp_path / "concat.mp4"
-                self.progress.emit(85, "장면 순서대로 병합 중...")
-                self._concat_clips(rendered_clips, concat_output, temp_path)
+                self.progress.emit(85, "장면 전환 효과 적용 및 병합 중...")
+                self._merge_rendered_clips(rendered_clips, clip_durations, concat_output, temp_path)
 
                 if self.music_path:
                     self.progress.emit(92, "배경음악 삽입 중...")
@@ -464,6 +508,14 @@ class ExportWorker(QObject):
             raise FileNotFoundError("ffmpeg.exe 경로가 없습니다. [ffmpeg 선택]으로 지정해 주세요.")
         if not self.scenes:
             raise ValueError("렌더링할 장면이 없습니다.")
+        if self.transition_mode not in TRANSITION_MODES:
+            raise ValueError("장면 전환 방식이 올바르지 않습니다.")
+        if not 0.2 <= self.transition_duration <= 2.0:
+            raise ValueError("전환 시간은 0.2~2.0초 범위로 입력해 주세요.")
+        if not 0.2 <= self.edge_fade_duration <= 3.0:
+            raise ValueError("시작/종료 페이드 시간은 0.2~3.0초 범위로 입력해 주세요.")
+
+        scene_durations: list[float] = []
         for scene in self.scenes:
             if not scene.video_path or not Path(scene.video_path).exists():
                 raise FileNotFoundError(f"영상 파일을 찾을 수 없습니다: {scene.video_path}")
@@ -476,12 +528,42 @@ class ExportWorker(QObject):
                     "시간 입력을 확인해 주세요. "
                     f"종료 시간은 시작 시간보다 커야 합니다: {scene.scene_name or scene.video_path}"
                 )
+            scene_durations.append(end_seconds - start_seconds)
         if self.logo_path and not Path(self.logo_path).exists():
             raise FileNotFoundError(f"로고 파일을 찾을 수 없습니다: {self.logo_path}")
         if self.music_path and not Path(self.music_path).exists():
             raise FileNotFoundError(f"배경음악 파일을 찾을 수 없습니다: {self.music_path}")
+        if len(scene_durations) > 1 and self.transition_mode in (TRANSITION_CROSSFADE, TRANSITION_FADE_BLACK):
+            shortest = min(scene_durations)
+            if self.transition_duration >= shortest / 2:
+                raise ValueError(
+                    "전환 시간이 너무 깁니다. "
+                    f"가장 짧은 장면({shortest:.1f}초)의 절반보다 짧게 설정해 주세요."
+                )
+        if self.fade_in_enabled and self.edge_fade_duration >= scene_durations[0]:
+            raise ValueError("첫 장면 페이드 시간이 첫 장면 길이보다 짧아야 합니다.")
+        if self.fade_out_enabled and self.edge_fade_duration >= scene_durations[-1]:
+            raise ValueError("마지막 장면 페이드 시간이 마지막 장면 길이보다 짧아야 합니다.")
+        if len(scene_durations) > 1 and self.transition_mode == TRANSITION_FADE_BLACK:
+            if self.fade_in_enabled and self.edge_fade_duration + self.transition_duration >= scene_durations[0]:
+                raise ValueError("첫 장면 길이가 시작 페이드와 전환 페이드를 함께 적용하기에 너무 짧습니다.")
+            if self.fade_out_enabled and self.edge_fade_duration + self.transition_duration >= scene_durations[-1]:
+                raise ValueError("마지막 장면 길이가 종료 페이드와 전환 페이드를 함께 적용하기에 너무 짧습니다.")
 
-    def _render_scene(self, scene: Scene, index: int, temp_path: Path) -> Path:
+    def _scene_duration_seconds(self, scene: Scene) -> float:
+        """장면의 시작/종료 시간으로 렌더링될 클립 길이를 계산합니다."""
+
+        start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
+        end_seconds = parse_time_to_seconds(scene.end_time.strip())
+        return end_seconds - start_seconds
+
+    def _render_scene(
+        self,
+        scene: Scene,
+        index: int,
+        temp_path: Path,
+        duration_seconds: float,
+    ) -> Path:
         """하나의 원본 영상을 잘라 1920x1080, 자막, 로고가 포함된 MP4로 만듭니다."""
 
         output_clip = temp_path / f"scene_{index:03d}.mp4"
@@ -500,11 +582,23 @@ class ExportWorker(QObject):
 
         start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
         end_seconds = parse_time_to_seconds(scene.end_time.strip())
-        duration_seconds = end_seconds - start_seconds
-        if scene.subtitle.strip():
+        if self.subtitle_enabled and scene.subtitle.strip():
             subtitle_file = temp_path / f"subtitle_{index:03d}.ass"
             write_ass_subtitle(subtitle_file, scene.subtitle, duration_seconds)
             video_filters.append(f"subtitles='{ffmpeg_filter_path(str(subtitle_file))}'")
+
+        total_scenes = len(self.scenes)
+        if self.transition_mode == TRANSITION_FADE_BLACK and total_scenes > 1:
+            if index > 1:
+                video_filters.append(f"fade=t=in:st=0:d={self.transition_duration:.3f}")
+            if index < total_scenes:
+                fade_start = max(duration_seconds - self.transition_duration, 0)
+                video_filters.append(f"fade=t=out:st={fade_start:.3f}:d={self.transition_duration:.3f}")
+        if self.fade_in_enabled and index == 1:
+            video_filters.append(f"fade=t=in:st=0:d={self.edge_fade_duration:.3f}")
+        if self.fade_out_enabled and index == total_scenes:
+            fade_start = max(duration_seconds - self.edge_fade_duration, 0)
+            video_filters.append(f"fade=t=out:st={fade_start:.3f}:d={self.edge_fade_duration:.3f}")
 
         self.log.emit(
             "임시 클립 생성: "
@@ -577,6 +671,81 @@ class ExportWorker(QObject):
             "copy",
             str(output_path),
         ]
+        run_process(command, self.log)
+
+    def _merge_rendered_clips(
+        self,
+        clips: list[Path],
+        clip_durations: list[float],
+        output_path: Path,
+        temp_path: Path,
+    ) -> None:
+        """선택한 장면 전환 방식에 맞춰 렌더링된 임시 클립들을 하나로 합칩니다."""
+
+        if len(clips) == 1:
+            if self.transition_mode != TRANSITION_NONE:
+                self.log.emit("장면이 1개뿐이어서 클립 사이 전환 효과는 적용하지 않습니다.")
+            self._concat_clips(clips, output_path, temp_path)
+            return
+
+        if self.transition_mode == TRANSITION_CROSSFADE:
+            self._xfade_clips(clips, clip_durations, output_path)
+            return
+
+        if self.transition_mode == TRANSITION_FADE_BLACK:
+            self.log.emit("페이드 투 블랙 적용: 각 장면의 시작/끝 페이드를 넣은 뒤 병합합니다.")
+            self._concat_clips(clips, output_path, temp_path)
+            return
+
+        self._concat_clips(clips, output_path, temp_path)
+
+    def _xfade_clips(self, clips: list[Path], clip_durations: list[float], output_path: Path) -> None:
+        """ffmpeg xfade 필터로 임시 클립 사이를 크로스페이드합니다."""
+
+        transition_duration = self.transition_duration
+        command = [self.ffmpeg_path, "-y"]
+        for clip in clips:
+            command.extend(["-i", str(clip)])
+
+        filter_parts: list[str] = []
+        previous_label = "0:v"
+        current_timeline_duration = clip_durations[0]
+        for input_index in range(1, len(clips)):
+            output_label = f"v{input_index}"
+            # xfade의 offset은 "현재까지 만들어진 타임라인에서 다음 클립과 겹치기 시작할 시점"입니다.
+            # 첫 전환은 첫 클립 끝에서 transition_duration만큼 앞당긴 지점이고,
+            # 이후에는 이전 xfade 때문에 전체 길이가 transition_duration씩 줄어든 상태를 누적합니다.
+            offset = current_timeline_duration - transition_duration
+            filter_parts.append(
+                f"[{previous_label}][{input_index}:v]"
+                f"xfade=transition=fade:duration={transition_duration:.3f}:offset={offset:.3f}"
+                f"[{output_label}]"
+            )
+            current_timeline_duration += clip_durations[input_index] - transition_duration
+            previous_label = output_label
+
+        filter_complex = ";".join(filter_parts)
+        command.extend(
+            [
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                f"[{previous_label}]",
+                "-an",
+                "-r",
+                "30",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                str(output_path),
+            ]
+        )
+        self.log.emit(f"크로스페이드 적용: {transition_duration:.1f}초")
         run_process(command, self.log)
 
     def _mix_background_music(self, video_path: Path) -> None:
@@ -852,6 +1021,13 @@ class MainWindow(QMainWindow):
         self.subtitle_mask_mode_combo = QComboBox()
         self.subtitle_mask_height_spin = QSpinBox()
         self.subtitle_mask_y_edit = QLineEdit()
+        self.transition_mode_combo = QComboBox()
+        self.transition_duration_spin = QDoubleSpinBox()
+        self.fade_in_checkbox = QCheckBox("첫 장면 페이드 인")
+        self.fade_out_checkbox = QCheckBox("마지막 장면 페이드 아웃")
+        self.edge_fade_duration_spin = QDoubleSpinBox()
+        self.subtitle_enabled_checkbox = QCheckBox("장면 자막 넣기")
+        self.subtitle_enabled_checkbox.setChecked(True)
         self.table = QTableWidget(0, 5)
         self.log_edit = QPlainTextEdit()
         self.progress_bar = QProgressBar()
@@ -1013,6 +1189,21 @@ class MainWindow(QMainWindow):
         logo_button = QPushButton("회사 로고 PNG 선택")
         music_button = QPushButton("배경음악 MP3 선택")
         output_button = QPushButton("최종 영상 저장 위치 선택")
+        # 회사 홍보영상에서는 기본적으로 크로스페이드 0.7초가 자연스럽습니다.
+        self.transition_mode_combo.addItems(TRANSITION_MODES)
+        self.transition_mode_combo.setCurrentText(TRANSITION_CROSSFADE)
+        self.transition_duration_spin.setRange(0.2, 2.0)
+        self.transition_duration_spin.setSingleStep(0.1)
+        self.transition_duration_spin.setDecimals(1)
+        self.transition_duration_spin.setValue(0.7)
+        self.transition_duration_spin.setSuffix(" 초")
+        self.fade_in_checkbox.setChecked(True)
+        self.fade_out_checkbox.setChecked(True)
+        self.edge_fade_duration_spin.setRange(0.2, 3.0)
+        self.edge_fade_duration_spin.setSingleStep(0.1)
+        self.edge_fade_duration_spin.setDecimals(1)
+        self.edge_fade_duration_spin.setValue(1.0)
+        self.edge_fade_duration_spin.setSuffix(" 초")
         final_layout.addWidget(QLabel("회사 로고 PNG"), 0, 0)
         final_layout.addWidget(self.logo_edit, 0, 1)
         final_layout.addWidget(logo_button, 0, 2)
@@ -1022,7 +1213,16 @@ class MainWindow(QMainWindow):
         final_layout.addWidget(QLabel("최종 출력 MP4"), 2, 0)
         final_layout.addWidget(self.output_edit, 2, 1)
         final_layout.addWidget(output_button, 2, 2)
-        final_layout.addWidget(self.export_button, 3, 0, 1, 3)
+        final_layout.addWidget(QLabel("장면 전환 방식"), 3, 0)
+        final_layout.addWidget(self.transition_mode_combo, 3, 1)
+        final_layout.addWidget(QLabel("전환 시간"), 3, 2)
+        final_layout.addWidget(self.transition_duration_spin, 3, 3)
+        final_layout.addWidget(self.fade_in_checkbox, 4, 0, 1, 2)
+        final_layout.addWidget(self.fade_out_checkbox, 4, 2, 1, 2)
+        final_layout.addWidget(self.subtitle_enabled_checkbox, 5, 0, 1, 4)
+        final_layout.addWidget(QLabel("시작/종료 페이드 시간"), 6, 0)
+        final_layout.addWidget(self.edge_fade_duration_spin, 6, 1, 1, 3)
+        final_layout.addWidget(self.export_button, 7, 0, 1, 4)
 
         # Progress and logs: keep status visible without taking space from the preview.
         progress_box = QGroupBox("진행률 / 로그")
@@ -1500,6 +1700,12 @@ class MainWindow(QMainWindow):
             logo_path=self.logo_edit.text().strip(),
             music_path=self.music_edit.text().strip(),
             scenes=self._all_scenes(),
+            transition_mode=self.transition_mode_combo.currentText(),
+            transition_duration=self.transition_duration_spin.value(),
+            fade_in_enabled=self.fade_in_checkbox.isChecked(),
+            fade_out_enabled=self.fade_out_checkbox.isChecked(),
+            edge_fade_duration=self.edge_fade_duration_spin.value(),
+            subtitle_enabled=self.subtitle_enabled_checkbox.isChecked(),
         )
         Path(file_path).write_text(
             json.dumps(project.to_dict(), ensure_ascii=False, indent=2),
@@ -1522,6 +1728,12 @@ class MainWindow(QMainWindow):
         self.ffmpeg_edit.setText(project.ffmpeg_path)
         self.logo_edit.setText(project.logo_path)
         self.music_edit.setText(project.music_path)
+        self.transition_mode_combo.setCurrentText(project.transition_mode)
+        self.transition_duration_spin.setValue(project.transition_duration)
+        self.fade_in_checkbox.setChecked(project.fade_in_enabled)
+        self.fade_out_checkbox.setChecked(project.fade_out_enabled)
+        self.edge_fade_duration_spin.setValue(project.edge_fade_duration)
+        self.subtitle_enabled_checkbox.setChecked(project.subtitle_enabled)
         self._set_scenes(project.scenes or [])
         self.log(f"프로젝트 불러오기 완료: {file_path}")
 
@@ -1554,6 +1766,7 @@ class MainWindow(QMainWindow):
             errors.append(f"배경음악 MP3 파일을 찾을 수 없습니다: {music_path}")
 
         total_duration = 0.0
+        scene_durations: list[float] = []
         for index, scene in enumerate(scenes, start=1):
             label = scene.scene_name or Path(scene.video_path).name or f"{index}번 장면"
             if not scene.video_path or not Path(scene.video_path).exists():
@@ -1571,12 +1784,47 @@ class MainWindow(QMainWindow):
             if start_seconds < 0 or end_seconds <= start_seconds:
                 errors.append(f"{index}번 장면 종료 시간은 시작 시간보다 커야 합니다: {label}")
                 continue
-            total_duration += end_seconds - start_seconds
+            duration = end_seconds - start_seconds
+            scene_durations.append(duration)
+            total_duration += duration
+
+        transition_mode = self.transition_mode_combo.currentText()
+        transition_duration = self.transition_duration_spin.value()
+        fade_in_enabled = self.fade_in_checkbox.isChecked()
+        fade_out_enabled = self.fade_out_checkbox.isChecked()
+        edge_fade_duration = self.edge_fade_duration_spin.value()
+        if transition_mode not in TRANSITION_MODES:
+            errors.append("장면 전환 방식이 올바르지 않습니다.")
+        if len(scene_durations) > 1 and transition_mode in (TRANSITION_CROSSFADE, TRANSITION_FADE_BLACK):
+            shortest = min(scene_durations)
+            if transition_duration >= shortest / 2:
+                errors.append(
+                    "전환 시간이 너무 깁니다. "
+                    f"가장 짧은 장면({shortest:.1f}초)의 절반보다 짧게 설정해 주세요."
+                )
+        elif len(scene_durations) == 1 and transition_mode != TRANSITION_NONE:
+            warnings.append("장면이 1개뿐이어서 클립 사이 전환 효과는 적용되지 않습니다.")
+        if scene_durations:
+            if fade_in_enabled and edge_fade_duration >= scene_durations[0]:
+                errors.append("첫 장면 페이드 시간이 첫 장면 길이보다 짧아야 합니다.")
+            if fade_out_enabled and edge_fade_duration >= scene_durations[-1]:
+                errors.append("마지막 장면 페이드 시간이 마지막 장면 길이보다 짧아야 합니다.")
+            if len(scene_durations) > 1 and transition_mode == TRANSITION_FADE_BLACK:
+                if fade_in_enabled and edge_fade_duration + transition_duration >= scene_durations[0]:
+                    errors.append("첫 장면 길이가 시작 페이드와 전환 페이드를 함께 적용하기에 너무 짧습니다.")
+                if fade_out_enabled and edge_fade_duration + transition_duration >= scene_durations[-1]:
+                    errors.append("마지막 장면 길이가 종료 페이드와 전환 페이드를 함께 적용하기에 너무 짧습니다.")
 
         summary.append(f"장면 수: {len(scenes)}개")
         summary.append(f"예상 영상 길이: {format_seconds_for_display(total_duration)}")
         summary.append(f"로고: {'사용' if logo_path else '없음'}")
         summary.append(f"배경음악: {'사용' if music_path else '없음'}")
+        summary.append(f"장면 전환 방식: {transition_mode}")
+        summary.append(f"전환 시간: {transition_duration:.1f}초")
+        summary.append(f"첫 장면 페이드 인: {'사용' if fade_in_enabled else '없음'}")
+        summary.append(f"마지막 장면 페이드 아웃: {'사용' if fade_out_enabled else '없음'}")
+        summary.append(f"시작/종료 페이드 시간: {edge_fade_duration:.1f}초")
+        summary.append(f"장면 자막: {'사용' if self.subtitle_enabled_checkbox.isChecked() else '사용 안 함'}")
         summary.append(f"출력 파일: {output_path or '(미선택)'}")
         return errors, warnings, summary
 
@@ -1756,6 +2004,14 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("0% - 시작 준비")
         self.log("===== 최종 MP4 생성 시작 =====")
+        self.log(
+            "전환 설정: "
+            f"{self.transition_mode_combo.currentText()}, "
+            f"전환 {self.transition_duration_spin.value():.1f}초, "
+            f"첫 페이드 {'사용' if self.fade_in_checkbox.isChecked() else '없음'}, "
+            f"마지막 페이드 {'사용' if self.fade_out_checkbox.isChecked() else '없음'}"
+        )
+        self.log(f"장면 자막: {'사용' if self.subtitle_enabled_checkbox.isChecked() else '사용 안 함'}")
 
         self.worker_thread = QThread(self)
         self.worker = ExportWorker(
@@ -1764,6 +2020,12 @@ class MainWindow(QMainWindow):
             logo_path=self.logo_edit.text().strip(),
             music_path=self.music_edit.text().strip(),
             output_path=output_path,
+            transition_mode=self.transition_mode_combo.currentText(),
+            transition_duration=self.transition_duration_spin.value(),
+            fade_in_enabled=self.fade_in_checkbox.isChecked(),
+            fade_out_enabled=self.fade_out_checkbox.isChecked(),
+            edge_fade_duration=self.edge_fade_duration_spin.value(),
+            subtitle_enabled=self.subtitle_enabled_checkbox.isChecked(),
         )
         self.worker.moveToThread(self.worker_thread)
 
