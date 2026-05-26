@@ -26,7 +26,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -49,6 +50,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -442,7 +444,37 @@ Dialogue: 0,0:00:00.00,{end_time},MarineGlory,,0,0,0,,{safe_text}
     path.write_text(ass_text, encoding="utf-8-sig")
 
 
-def read_video_duration_seconds(ffmpeg_path: str, video_path: str) -> float | None:
+def find_ffprobe_for_ffmpeg(ffmpeg_path: str) -> str:
+    """ffmpeg.exe와 같은 폴더에 있는 ffprobe.exe를 찾습니다."""
+
+    if not ffmpeg_path:
+        return ""
+    ffmpeg_file = Path(ffmpeg_path)
+    candidates = [
+        ffmpeg_file.with_name("ffprobe.exe"),
+        ffmpeg_file.with_name("ffprobe"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    path_ffprobe = shutil.which("ffprobe")
+    return path_ffprobe or ""
+
+
+def _short_process_output(output: str, limit: int = 1200) -> str:
+    """ffmpeg/ffprobe 출력에서 로그로 보기 좋은 마지막 부분만 반환합니다."""
+
+    output = output.strip()
+    if not output:
+        return "(출력 없음)"
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    text = "\n".join(lines[-12:])
+    if len(text) > limit:
+        text = "..." + text[-limit:]
+    return text
+
+
+def read_video_duration_seconds(ffmpeg_path: str, video_path: str, log: Any | None = None) -> float | None:
     """
     ffmpeg.exe로 영상 메타데이터를 읽어 전체 길이를 초 단위로 반환합니다.
 
@@ -450,8 +482,51 @@ def read_video_duration_seconds(ffmpeg_path: str, video_path: str) -> float | No
     파싱합니다. 읽지 못하면 None을 반환하고 export 검증에서 안내합니다.
     """
 
-    if not ffmpeg_path or not Path(ffmpeg_path).exists() or not Path(video_path).exists():
+    def emit(message: str) -> None:
+        if log is not None:
+            log(message)
+
+    if not ffmpeg_path or not Path(ffmpeg_path).exists():
+        emit(f"영상 길이 읽기 실패: ffmpeg.exe 경로가 없습니다: {ffmpeg_path}")
         return None
+    if not video_path or not Path(video_path).exists():
+        emit(f"영상 길이 읽기 실패: 영상 파일이 없습니다: {video_path}")
+        return None
+
+    ffprobe_path = find_ffprobe_for_ffmpeg(ffmpeg_path)
+    if ffprobe_path:
+        try:
+            process = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    video_path,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            output = process.stdout.strip()
+            duration = float(output) if output else 0.0
+            if process.returncode == 0 and duration > 0:
+                emit(f"ffprobe 영상 길이 읽기 성공: {duration:.3f}초")
+                return duration
+            emit(
+                "ffprobe 영상 길이 읽기 실패: "
+                f"returncode={process.returncode}, output={_short_process_output(process.stdout)}"
+            )
+        except Exception as exc:
+            emit(f"ffprobe 실행 실패: {exc}")
+    else:
+        emit("ffprobe.exe를 찾지 못해 ffmpeg -i 출력 파싱으로 길이를 읽습니다.")
 
     process = subprocess.run(
         [ffmpeg_path, "-hide_banner", "-i", video_path],
@@ -464,9 +539,15 @@ def read_video_duration_seconds(ffmpeg_path: str, video_path: str) -> float | No
     )
     match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", process.stdout)
     if not match:
+        emit(
+            "ffmpeg Duration 파싱 실패: "
+            f"returncode={process.returncode}, output={_short_process_output(process.stdout)}"
+        )
         return None
     hours, minutes, seconds = match.groups()
-    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    emit(f"ffmpeg 영상 길이 읽기 성공: {duration:.3f}초")
+    return duration
 
 
 def run_process(command: list[str], log: Signal) -> None:
@@ -1253,13 +1334,22 @@ class MainWindow(QMainWindow):
         # 영상 미리보기 상태: QtMultimedia는 ffmpeg 자르기와 별개로 동작하므로
         # 코덱 문제로 재생에 실패해도 기존 클립 저장 기능은 계속 사용할 수 있습니다.
         self.preview_video_widget = QVideoWidget()
+        self.preview_frame_label = QLabel()
+        self.preview_stack = QStackedWidget()
         self.preview_player = QMediaPlayer(self)
         self.preview_audio_output = QAudioOutput(self)
         self.preview_slider = QSlider(Qt.Horizontal)
         self.preview_time_label = QLabel("00:00:00 / 00:00:00")
         self.preview_slider_dragging = False
+        self.preview_mode = "player"
+        self.current_preview_seconds = 0.0
+        self.preview_total_seconds = 0.0
         self.preview_current_path = ""
+        self.preview_original_path = ""
+        self.preview_frame_cache_dir = Path.cwd() / "preview-cache"
         self.preview_stop_at_ms: int | None = None
+        self.preview_duration_check_token = 0
+        self.preview_frame_timer = QTimer(self)
 
         self.worker_thread: QThread | None = None
         self.worker: ExportWorker | None = None
@@ -1397,10 +1487,18 @@ class MainWindow(QMainWindow):
             button.setMinimumHeight(38)
         self.preview_video_widget.setMinimumHeight(420)
         self.preview_video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_frame_label.setMinimumHeight(420)
+        self.preview_frame_label.setAlignment(Qt.AlignCenter)
+        self.preview_frame_label.setStyleSheet("background: #050505; color: #d8d8d8;")
+        self.preview_frame_label.setText("ffmpeg 프레임 미리보기")
+        self.preview_frame_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_stack.addWidget(self.preview_video_widget)
+        self.preview_stack.addWidget(self.preview_frame_label)
+        self.preview_stack.setCurrentIndex(0)
         self.preview_slider.setRange(0, 0)
 
         preview_layout.addWidget(self.preview_mode_label, 0, 0, 1, 6)
-        preview_layout.addWidget(self.preview_video_widget, 1, 0, 1, 6)
+        preview_layout.addWidget(self.preview_stack, 1, 0, 1, 6)
         preview_layout.addWidget(preview_set_start_button, 2, 0, 1, 2)
         preview_layout.addWidget(preview_set_end_button, 2, 2, 1, 2)
         preview_layout.addWidget(preview_range_button, 2, 4, 1, 2)
@@ -1481,6 +1579,8 @@ class MainWindow(QMainWindow):
         self.preview_slider.sliderPressed.connect(self._preview_slider_pressed)
         self.preview_slider.sliderReleased.connect(self._preview_slider_released)
         self.preview_slider.valueChanged.connect(self._preview_slider_value_changed)
+        self.preview_frame_timer.setInterval(500)
+        self.preview_frame_timer.timeout.connect(self._advance_frame_preview_playback)
 
         ffmpeg_button.clicked.connect(self.choose_ffmpeg)
         logo_button.clicked.connect(self.choose_logo)
@@ -1503,8 +1603,8 @@ class MainWindow(QMainWindow):
         self.export_all_clips_button.clicked.connect(self.export_all_clips)
         self.export_button.clicked.connect(self.export_video)
         preview_final_button.clicked.connect(self.preview_final_output)
-        preview_play_button.clicked.connect(self.preview_player.play)
-        preview_pause_button.clicked.connect(self.preview_player.pause)
+        preview_play_button.clicked.connect(self._play_preview)
+        preview_pause_button.clicked.connect(self._pause_preview)
         preview_stop_button.clicked.connect(self._stop_preview)
         preview_back_button.clicked.connect(lambda: self._seek_preview_by(-5000))
         preview_forward_button.clicked.connect(lambda: self._seek_preview_by(5000))
@@ -1566,7 +1666,7 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem(value)
             if column in (2, 3, 4):
                 item.setTextAlignment(Qt.AlignCenter)
-        self.table.setItem(row, column, item)
+            self.table.setItem(row, column, item)
         mode_combo = QComboBox()
         mode_combo.addItems(list(DURATION_MODE_VALUES.keys()))
         mode_combo.setCurrentText(DURATION_MODE_LABELS[normalize_duration_mode(scene.duration_mode)])
@@ -1656,31 +1756,229 @@ class MainWindow(QMainWindow):
         scene = self._scene_from_row(row)
         video_path = scene.video_path.strip()
         if not video_path:
-            self.log(f"미리보기: {row + 1}번 장면에 영상 파일이 없습니다.")
+            self.log(
+                f"미리보기: {row + 1}번 장면에는 아직 영상이 배정되지 않았습니다. "
+                "원본 영상 추가로 클립을 넣어 주세요."
+            )
             return
-        if not Path(video_path).exists():
+        video_file = Path(video_path)
+        exists = video_file.exists()
+        self.log(f"미리보기 파일 확인: exists={exists}, path={video_path}")
+        if not exists:
             self.log(f"미리보기: 영상 파일을 찾을 수 없습니다: {video_path}")
             return
 
-        if video_path != self.preview_current_path:
+        if video_path != self.preview_original_path:
             self.preview_stop_at_ms = None
-            self.preview_current_path = video_path
-            self.preview_player.setSource(QUrl.fromLocalFile(video_path))
-            self.preview_slider.setValue(0)
-            self.preview_time_label.setText("00:00:00 / 00:00:00")
-            self.preview_mode_label.setText("선택한 원본 클립의 구간을 확인합니다.")
-            self.log(f"미리보기 영상 로드: {video_path}")
+            self.preview_frame_timer.stop()
+            self.preview_original_path = video_path
+            self.current_preview_seconds = 0.0
+            self.preview_total_seconds = read_video_duration_seconds(
+                self.ffmpeg_edit.text().strip(),
+                video_path,
+                self.log,
+            ) or 0.0
+            total_ms = int(max(self.preview_total_seconds, 0.0) * 1000)
+            self.preview_slider.setRange(0, total_ms)
+            self._update_preview_time_label(0, total_ms)
+            preview_path = self._create_preview_proxy(video_path) or video_path
+            self._load_video_into_preview(preview_path, video_path)
 
         start_text = scene.start_time.strip() or "00:00:00"
         end_text = scene.end_time.strip() or "(미입력)"
         self.log(f"선택 장면 구간: 시작 {start_text}, 종료 {end_text}")
 
+    def _load_video_into_preview(self, preview_path: str, original_path: str) -> None:
+        """QMediaPlayer에 미리보기 파일을 로드하고 duration 0 상태를 별도로 확인합니다."""
+
+        self.preview_mode = "player"
+        self.preview_stack.setCurrentIndex(0)
+        self.preview_current_path = preview_path
+        self.preview_player.setSource(QUrl.fromLocalFile(preview_path))
+        self.preview_slider.setValue(0)
+        self.current_preview_seconds = 0.0
+        total_ms = int(max(self.preview_total_seconds, 0.0) * 1000)
+        if total_ms > 0:
+            self.preview_slider.setRange(0, total_ms)
+            self._update_preview_time_label(0, total_ms)
+        else:
+            self.preview_time_label.setText("00:00:00 / 00:00:00")
+        if preview_path != original_path:
+            self.preview_mode_label.setText("프록시 MP4 미리보기: 원본은 ffmpeg 렌더링에 사용됩니다.")
+            self.log(f"미리보기 프록시 로드: {preview_path}")
+        else:
+            self.preview_mode_label.setText("선택한 원본 클립의 구간을 확인합니다.")
+            self.log(f"미리보기 원본 로드: {preview_path}")
+        self.preview_duration_check_token += 1
+        token = self.preview_duration_check_token
+        QTimer.singleShot(1500, lambda: self._check_preview_duration_after_load(token, original_path))
+
+    def _check_preview_duration_after_load(self, token: int, original_path: str) -> None:
+        """setSource 뒤에도 길이가 0이면 QtMultimedia 코덱 문제 가능성을 안내합니다."""
+
+        if token != self.preview_duration_check_token:
+            return
+        if self.preview_mode != "player":
+            return
+        if self.preview_player.duration() <= 0:
+            self.log("내장 플레이어 미리보기 실패. ffmpeg 프레임 미리보기 모드로 전환합니다.")
+            self._switch_to_frame_preview(original_path)
+            self.log(
+                "미리보기 플레이어가 영상을 읽지 못했습니다. "
+                "미리보기 코덱 문제일 수 있으며, ffmpeg 렌더링은 별도로 가능합니다. "
+                f"원본: {original_path}"
+            )
+
+    def _switch_to_frame_preview(self, video_path: str) -> None:
+        """QMediaPlayer 대신 ffmpeg로 추출한 정지 프레임을 표시하는 모드로 전환합니다."""
+
+        if not video_path:
+            return
+        self.preview_player.pause()
+        self.preview_frame_timer.stop()
+        self.preview_mode = "frame"
+        self.preview_stack.setCurrentIndex(1)
+        self.preview_original_path = video_path
+        self.preview_current_path = video_path
+        if self.preview_total_seconds <= 0:
+            self.preview_total_seconds = read_video_duration_seconds(
+                self.ffmpeg_edit.text().strip(),
+                video_path,
+                self.log,
+            ) or 0.0
+        total_ms = int(max(self.preview_total_seconds, 0.0) * 1000)
+        self.preview_slider.setRange(0, total_ms)
+        self.current_preview_seconds = max(0.0, min(self.current_preview_seconds, self.preview_total_seconds))
+        self.preview_slider.setValue(int(self.current_preview_seconds * 1000))
+        self._update_preview_time_label(int(self.current_preview_seconds * 1000), total_ms)
+        self.preview_mode_label.setText("ffmpeg 프레임 미리보기: 슬라이더로 시점을 찾고 시작/종료 시간을 지정합니다.")
+        self.log("ffmpeg 프레임 미리보기 모드로 전환했습니다.")
+        self._show_preview_frame(video_path, self.current_preview_seconds)
+
+    def render_preview_frame(self, video_path: str, seconds: float) -> Path:
+        """ffmpeg로 현재 시점의 프레임 JPG를 추출합니다."""
+
+        ffmpeg_path = self.ffmpeg_edit.text().strip()
+        if not ffmpeg_path or not Path(ffmpeg_path).exists():
+            raise FileNotFoundError("ffmpeg.exe 경로가 없습니다.")
+        if not video_path or not Path(video_path).exists():
+            raise FileNotFoundError(f"영상 파일을 찾을 수 없습니다: {video_path}")
+
+        self.preview_frame_cache_dir.mkdir(parents=True, exist_ok=True)
+        frame_path = self.preview_frame_cache_dir / "frame_preview.jpg"
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-ss",
+            format_seconds_for_ffmpeg(max(seconds, 0.0)),
+            "-i",
+            video_path,
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=960:-2",
+            str(frame_path),
+        ]
+        process = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if process.returncode != 0 or not frame_path.exists() or frame_path.stat().st_size <= 0:
+            self.log(
+                "ffmpeg 프레임 추출 실패: "
+                f"returncode={process.returncode}, output={_short_process_output(process.stdout)}"
+            )
+            raise RuntimeError("ffmpeg 프레임 추출 실패")
+        return frame_path
+
+    def _show_preview_frame(self, video_path: str, seconds: float) -> None:
+        """추출한 프레임을 QLabel에 비율 유지로 표시합니다."""
+
+        try:
+            frame_path = self.render_preview_frame(video_path, seconds)
+        except Exception as exc:
+            self.preview_frame_label.setText(f"프레임 미리보기 실패\n{exc}")
+            return
+        pixmap = QPixmap(str(frame_path))
+        if pixmap.isNull():
+            self.preview_frame_label.setText("프레임 이미지를 표시하지 못했습니다.")
+            return
+        scaled = pixmap.scaled(
+            self.preview_frame_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.preview_frame_label.setPixmap(scaled)
+
+    def _create_preview_proxy(self, video_path: str) -> str:
+        """QMediaPlayer가 읽기 쉬운 H.264/yuv420p 10초 프록시 MP4를 생성합니다."""
+
+        ffmpeg_path = self.ffmpeg_edit.text().strip()
+        if not ffmpeg_path or not Path(ffmpeg_path).exists():
+            self.log("미리보기 프록시 생성 건너뜀: ffmpeg.exe 경로가 없습니다.")
+            return ""
+
+        cache_dir = self.preview_frame_cache_dir
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        proxy_path = cache_dir / "preview_proxy.mp4"
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            video_path,
+            "-t",
+            "10",
+            "-vf",
+            "scale=1280:-2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-an",
+            str(proxy_path),
+        ]
+        self.log("미리보기 프록시 생성 시작: " + " ".join(f'"{part}"' if " " in part else part for part in command))
+        try:
+            process = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception as exc:
+            self.log(f"미리보기 프록시 생성 실패: {exc}")
+            return ""
+        if process.returncode != 0 or not proxy_path.exists() or proxy_path.stat().st_size <= 0:
+            self.log(
+                "미리보기 프록시 생성 실패: "
+                f"returncode={process.returncode}, output={_short_process_output(process.stdout)}"
+            )
+            return ""
+        self.log(f"미리보기 프록시 생성 완료: {proxy_path}")
+        return str(proxy_path)
+
     def _preview_position_changed(self, position_ms: int) -> None:
         """재생 위치가 바뀔 때 시간 표시와 슬라이더를 갱신하고 구간 미리보기를 종료합니다."""
 
+        if self.preview_mode != "player":
+            return
+        self.current_preview_seconds = max(position_ms, 0) / 1000
         if not self.preview_slider_dragging:
             self.preview_slider.setValue(position_ms)
-        self._update_preview_time_label(position_ms, self.preview_player.duration())
+        duration_ms = int(max(self.preview_total_seconds * 1000, self.preview_player.duration(), 0))
+        self._update_preview_time_label(position_ms, duration_ms)
 
         if self.preview_stop_at_ms is not None and position_ms >= self.preview_stop_at_ms:
             self.preview_player.pause()
@@ -1690,16 +1988,29 @@ class MainWindow(QMainWindow):
     def _preview_duration_changed(self, duration_ms: int) -> None:
         """영상 길이가 확인되면 슬라이더 범위를 영상 전체 길이에 맞춥니다."""
 
-        self.preview_slider.setRange(0, max(duration_ms, 0))
-        self._update_preview_time_label(self.preview_player.position(), duration_ms)
+        if self.preview_mode != "player":
+            return
+        if duration_ms > 0 and self.preview_total_seconds <= 0:
+            self.preview_total_seconds = duration_ms / 1000
+        range_ms = int(max(self.preview_total_seconds * 1000, duration_ms, 0))
+        self.preview_slider.setRange(0, range_ms)
+        self._update_preview_time_label(self.preview_player.position(), range_ms)
 
     def _preview_error_occurred(self, *args: Any) -> None:
         """미리보기 재생 실패를 로그에 남깁니다. ffmpeg 자르기 기능은 계속 사용할 수 있습니다."""
 
+        if self.preview_mode == "frame":
+            return
         error_message = self.preview_player.errorString().strip()
         if not error_message:
             error_message = "이 PC의 코덱/QtMultimedia 환경에서 미리보기를 재생하지 못했습니다."
-        self.log(f"미리보기 오류: {error_message}")
+        self.log(
+            f"미리보기 오류: {error_message} "
+            "미리보기 코덱 문제일 수 있으며, ffmpeg 렌더링은 별도로 가능합니다."
+        )
+
+        self.log("내장 플레이어 미리보기 실패. ffmpeg 프레임 미리보기 모드로 전환합니다.")
+        self._switch_to_frame_preview(self.preview_original_path)
 
     def _preview_slider_pressed(self) -> None:
         """사용자가 슬라이더를 잡고 있는 동안 positionChanged 업데이트와 충돌하지 않게 표시합니다."""
@@ -1710,13 +2021,23 @@ class MainWindow(QMainWindow):
         """슬라이더에서 손을 떼면 플레이어 위치를 해당 지점으로 이동합니다."""
 
         self.preview_slider_dragging = False
-        self.preview_player.setPosition(self.preview_slider.value())
+        if self.preview_mode == "frame":
+            self.current_preview_seconds = max(self.preview_slider.value(), 0) / 1000
+            self._update_preview_time_label(self.preview_slider.value(), int(self.preview_total_seconds * 1000))
+            self._show_preview_frame(self.preview_original_path, self.current_preview_seconds)
+        else:
+            self.preview_player.setPosition(self.preview_slider.value())
 
     def _preview_slider_value_changed(self, value: int) -> None:
         """드래그 중에는 시간 라벨을 먼저 갱신하고, 실제 이동은 release 시점에 수행합니다."""
 
         if self.preview_slider_dragging:
-            self._update_preview_time_label(value, self.preview_player.duration())
+            if self.preview_mode == "frame":
+                self.current_preview_seconds = max(value, 0) / 1000
+                self._update_preview_time_label(value, int(self.preview_total_seconds * 1000))
+            else:
+                duration_ms = int(max(self.preview_total_seconds * 1000, self.preview_player.duration(), 0))
+                self._update_preview_time_label(value, duration_ms)
 
     def _update_preview_time_label(self, position_ms: int, duration_ms: int) -> None:
         """현재 재생 위치와 전체 길이를 HH:MM:SS.mmm 형식으로 표시합니다."""
@@ -1725,19 +2046,74 @@ class MainWindow(QMainWindow):
         duration_text = format_milliseconds_for_display(duration_ms)
         self.preview_time_label.setText(f"{current_text} / {duration_text}")
 
+    def get_current_preview_seconds(self) -> float:
+        """현재 미리보기 위치를 player/frame 모드 공통 초 단위로 반환합니다."""
+
+        if self.preview_mode == "player":
+            return max(self.preview_player.position(), 0) / 1000
+        return max(self.current_preview_seconds, 0.0)
+
+    def _play_preview(self) -> None:
+        """player 모드는 QMediaPlayer, frame 모드는 타이머 기반 프레임 진행으로 재생합니다."""
+
+        if self.preview_mode == "frame":
+            if self.preview_original_path:
+                self.preview_frame_timer.start()
+            return
+        self.preview_player.play()
+
+    def _pause_preview(self) -> None:
+        if self.preview_mode == "frame":
+            self.preview_frame_timer.stop()
+        else:
+            self.preview_player.pause()
+
+    def _advance_frame_preview_playback(self) -> None:
+        """frame 모드에서 0.5초씩 이동하며 프레임을 갱신합니다."""
+
+        if self.preview_mode != "frame" or not self.preview_original_path:
+            self.preview_frame_timer.stop()
+            return
+        limit = self.preview_stop_at_ms / 1000 if self.preview_stop_at_ms is not None else self.preview_total_seconds
+        next_seconds = self.current_preview_seconds + 0.5
+        if limit > 0 and next_seconds >= limit:
+            next_seconds = limit
+            self.preview_frame_timer.stop()
+            self.preview_stop_at_ms = None
+            self.log("선택 구간 프레임 미리보기 종료")
+        self.current_preview_seconds = max(0.0, min(next_seconds, max(self.preview_total_seconds, next_seconds)))
+        current_ms = int(self.current_preview_seconds * 1000)
+        self.preview_slider.setValue(current_ms)
+        self._update_preview_time_label(current_ms, int(self.preview_total_seconds * 1000))
+        self._show_preview_frame(self.preview_original_path, self.current_preview_seconds)
+
     def _stop_preview(self) -> None:
         """미리보기 재생을 멈추고 구간 미리보기 종료 지점도 초기화합니다."""
 
         self.preview_stop_at_ms = None
-        self.preview_player.stop()
+        self.preview_frame_timer.stop()
+        if self.preview_mode == "frame":
+            self.current_preview_seconds = 0.0
+            self.preview_slider.setValue(0)
+            self._update_preview_time_label(0, int(self.preview_total_seconds * 1000))
+            if self.preview_original_path:
+                self._show_preview_frame(self.preview_original_path, 0.0)
+        else:
+            self.preview_player.stop()
 
     def _seek_preview_by(self, delta_ms: int) -> None:
         """Move the preview position while keeping it inside the loaded video range."""
 
-        duration_ms = max(self.preview_player.duration(), 0)
-        current_ms = self.preview_player.position()
+        duration_ms = int(max(self.preview_total_seconds * 1000, self.preview_player.duration(), 0))
+        current_ms = int(self.get_current_preview_seconds() * 1000)
         next_ms = max(0, min(current_ms + delta_ms, duration_ms))
-        self.preview_player.setPosition(next_ms)
+        if self.preview_mode == "frame":
+            self.current_preview_seconds = next_ms / 1000
+            self.preview_slider.setValue(next_ms)
+            if self.preview_original_path:
+                self._show_preview_frame(self.preview_original_path, self.current_preview_seconds)
+        else:
+            self.preview_player.setPosition(next_ms)
         self._update_preview_time_label(next_ms, duration_ms)
 
     def set_preview_position_as_start_time(self) -> None:
@@ -1758,7 +2134,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "장면 선택 필요", "시간을 입력할 장면 행을 선택해 주세요.")
             return
 
-        time_text = format_milliseconds_for_display(self.preview_player.position())
+        time_text = format_seconds_for_display(self.get_current_preview_seconds())
         self._set_table_text(row, column, time_text)
         self.log(f"{row + 1}번 장면 {label} 지정: {time_text}")
 
@@ -1786,8 +2162,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "구간 확인 필요", "종료 시간은 시작 시간보다 커야 합니다.")
             return
 
-        if scene.video_path.strip() and scene.video_path.strip() != self.preview_current_path:
+        if scene.video_path.strip() and scene.video_path.strip() != self.preview_original_path:
             self.load_selected_row_preview()
+
+        if self.preview_mode == "frame":
+            self._open_frame_range_preview(scene.video_path.strip(), start_seconds, end_seconds)
+            return
 
         self.preview_stop_at_ms = int(end_seconds * 1000)
         self.preview_player.setPosition(int(start_seconds * 1000))
@@ -1796,6 +2176,62 @@ class MainWindow(QMainWindow):
             "선택 구간 미리보기 시작: "
             f"{format_seconds_for_display(start_seconds)} ~ {format_seconds_for_display(end_seconds)}"
         )
+
+    def _open_frame_range_preview(self, video_path: str, start_seconds: float, end_seconds: float) -> None:
+        """frame 모드에서 선택 구간 MP4를 ffmpeg로 만든 뒤 외부 플레이어로 엽니다."""
+
+        ffmpeg_path = self.ffmpeg_edit.text().strip()
+        if not ffmpeg_path or not Path(ffmpeg_path).exists():
+            QMessageBox.warning(self, "ffmpeg 필요", "선택 구간 미리보기를 만들려면 ffmpeg.exe 경로가 필요합니다.")
+            return
+        if not video_path or not Path(video_path).exists():
+            QMessageBox.warning(self, "영상 없음", f"선택 구간 미리보기용 영상 파일을 찾을 수 없습니다:\n{video_path}")
+            return
+        self.preview_frame_cache_dir.mkdir(parents=True, exist_ok=True)
+        output_path = self.preview_frame_cache_dir / "preview_range.mp4"
+        duration_seconds = max(end_seconds - start_seconds, 0.001)
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-ss",
+            format_seconds_for_ffmpeg(start_seconds),
+            "-i",
+            video_path,
+            "-t",
+            format_seconds_for_ffmpeg(duration_seconds),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-an",
+            str(output_path),
+        ]
+        self.log("frame 모드 선택 구간 미리보기 생성 시작: " + " ".join(f'"{part}"' if " " in part else part for part in command))
+        process = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if process.returncode != 0 or not output_path.exists() or output_path.stat().st_size <= 0:
+            self.log(
+                "frame 모드 선택 구간 미리보기 생성 실패: "
+                f"returncode={process.returncode}, output={_short_process_output(process.stdout)}"
+            )
+            QMessageBox.warning(self, "미리보기 생성 실패", "선택 구간 미리보기 MP4를 만들지 못했습니다. 로그를 확인해 주세요.")
+            return
+        self.log(f"frame 모드 선택 구간 미리보기 생성 완료: {output_path}")
+        try:
+            os.startfile(output_path)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self.log(f"선택 구간 미리보기 열기 실패: {exc}")
 
     def _all_scenes(self) -> list[Scene]:
         """현재 표의 모든 장면을 순서대로 가져옵니다."""
@@ -1881,6 +2317,11 @@ class MainWindow(QMainWindow):
             return
 
         for file_path in file_paths:
+            exists = Path(file_path).exists()
+            self.log(f"원본 영상 파일 확인: exists={exists}, path={file_path}")
+            if not exists:
+                self.log(f"원본 영상 추가 실패: 파일을 찾을 수 없습니다: {file_path}")
+                continue
             if not is_supported_video_file(file_path):
                 self.log(f"지원하지 않는 영상 형식: {Path(file_path).name}")
                 continue
@@ -1904,16 +2345,19 @@ class MainWindow(QMainWindow):
                     )
                 )
             else:
-                self.table.item(target_row, 0).setText(file_path)
-                if duration_text and not self.table.item(target_row, 3).text().strip():
-                    self.table.item(target_row, 3).setText(duration_text)
+                self._set_table_text(target_row, 0, file_path)
+                end_item = self.table.item(target_row, 3)
+                end_text = end_item.text().strip() if end_item is not None else ""
+                if duration_text and not end_text:
+                    self._set_table_text(target_row, 3, duration_text)
                     self._set_table_text(target_row, 4, f"{clamp_scene_duration(parse_time_to_seconds(duration_text)):.1f}")
 
     def _duration_text_for_video(self, file_path: str) -> str:
         """영상 길이를 읽어 표에 넣을 종료 시간 문자열로 변환합니다."""
 
-        duration = read_video_duration_seconds(self.ffmpeg_edit.text().strip(), file_path)
+        duration = read_video_duration_seconds(self.ffmpeg_edit.text().strip(), file_path, self.log)
         if duration is None:
+            self.log(f"파일은 존재하지만 ffmpeg가 길이를 읽지 못했습니다: {file_path}")
             self.log(f"영상 길이 자동 입력 실패: {file_path}")
             return ""
         duration_text = format_seconds_for_display(duration)
@@ -1930,6 +2374,7 @@ class MainWindow(QMainWindow):
                 duration = read_video_duration_seconds(
                     self.ffmpeg_edit.text().strip(),
                     scene.video_path,
+                    self.log,
                 )
                 if duration is None:
                     warnings.append(f"종료 시간 자동 입력 실패: {scene.scene_name or scene.video_path}")
@@ -2442,7 +2887,11 @@ class MainWindow(QMainWindow):
             return
 
         self.preview_stop_at_ms = None
+        self.preview_frame_timer.stop()
+        self.preview_mode = "player"
+        self.preview_stack.setCurrentIndex(0)
         self.preview_current_path = str(path)
+        self.preview_original_path = str(path)
         self.preview_mode_label.setText("최종 결과 미리보기: 자막/로고/BGM/전환 효과가 적용된 MP4입니다.")
         self.preview_player.setSource(QUrl.fromLocalFile(str(path)))
         self.preview_slider.setValue(0)
