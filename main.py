@@ -75,6 +75,44 @@ SUBTITLE_MASK_MODES = [
     SUBTITLE_MASK_BLUR,
     SUBTITLE_MASK_BAR,
 ]
+SCENE_MIN_DURATION_SECONDS = 1.0
+SCENE_MAX_DURATION_SECONDS = 60.0
+SCENE_DEFAULT_DURATION_SECONDS = 5.0
+SCENE_DEFAULT_TRANSITION = TRANSITION_NONE
+DURATION_MODE_FREEZE = "freeze"
+DURATION_MODE_SLOW = "slow"
+DURATION_MODE_LOOP = "loop"
+DURATION_MODE_LABELS = {
+    DURATION_MODE_FREEZE: "정지 연장",
+    DURATION_MODE_SLOW: "슬로우 모션",
+    DURATION_MODE_LOOP: "반복 재생",
+}
+DURATION_MODE_VALUES = {label: value for value, label in DURATION_MODE_LABELS.items()}
+SCENE_DEFAULT_DURATION_MODE = DURATION_MODE_SLOW
+
+
+def clamp_scene_duration(value: Any) -> float:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        duration = SCENE_DEFAULT_DURATION_SECONDS
+    return max(SCENE_MIN_DURATION_SECONDS, min(SCENE_MAX_DURATION_SECONDS, duration))
+
+
+def normalize_scene_transition(value: Any) -> str:
+    transition = str(value or "").strip()
+    if transition == "cut":
+        return TRANSITION_NONE
+    return transition or SCENE_DEFAULT_TRANSITION
+
+
+def normalize_duration_mode(value: Any) -> str:
+    mode = str(value or "").strip()
+    if mode in DURATION_MODE_LABELS:
+        return mode
+    if mode in DURATION_MODE_VALUES:
+        return DURATION_MODE_VALUES[mode]
+    return SCENE_DEFAULT_DURATION_MODE
 
 
 # 초기 템플릿: 사용자가 촬영 영상을 추가하면 이 순서대로 장면명/자막을
@@ -101,19 +139,43 @@ class Scene:
     scene_name: str = ""
     start_time: str = "00:00:00"
     end_time: str = ""
+    duration: float = SCENE_DEFAULT_DURATION_SECONDS
+    transition: str = SCENE_DEFAULT_TRANSITION
+    duration_mode: str = SCENE_DEFAULT_DURATION_MODE
     subtitle: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Scene":
         """이전 버전 JSON을 읽어도 기본값을 유지하도록 안전하게 복원합니다."""
 
+        duration_value = data.get("duration")
+        if duration_value is None:
+            try:
+                start_seconds = parse_time_to_seconds(str(data.get("start_time", "00:00:00")).strip() or "0")
+                end_seconds = parse_time_to_seconds(str(data.get("end_time", "")).strip())
+                duration_value = end_seconds - start_seconds
+            except Exception:
+                duration_value = SCENE_DEFAULT_DURATION_SECONDS
+
         return cls(
-            video_path=str(data.get("video_path", "")),
-            scene_name=str(data.get("scene_name", "")),
+            video_path=str(data.get("clip", data.get("video_path", ""))),
+            scene_name=str(data.get("title", data.get("scene_name", ""))),
             start_time=str(data.get("start_time", "00:00:00")),
             end_time=str(data.get("end_time", "")),
+            duration=clamp_scene_duration(duration_value),
+            transition=normalize_scene_transition(data.get("transition", SCENE_DEFAULT_TRANSITION)),
+            duration_mode=normalize_duration_mode(data.get("duration_mode", SCENE_DEFAULT_DURATION_MODE)),
             subtitle=str(data.get("subtitle", "")),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["title"] = self.scene_name
+        data["clip"] = self.video_path
+        data["duration"] = clamp_scene_duration(self.duration)
+        data["transition"] = normalize_scene_transition(self.transition)
+        data["duration_mode"] = normalize_duration_mode(self.duration_mode)
+        return data
 
 
 @dataclass
@@ -157,7 +219,7 @@ class Project:
             "logo_path": self.logo_path,
             "music_path": self.music_path,
             "output_path": self.output_path,
-            "scenes": [asdict(scene) for scene in self.scenes or []],
+            "scenes": [scene.to_dict() for scene in self.scenes or []],
             "transition_mode": self.transition_mode,
             "transition_duration": self.transition_duration,
             "fade_in_enabled": self.fade_in_enabled,
@@ -522,6 +584,12 @@ class ExportWorker(QObject):
         for scene in self.scenes:
             if not scene.video_path or not Path(scene.video_path).exists():
                 raise FileNotFoundError(f"영상 파일을 찾을 수 없습니다: {scene.video_path}")
+            render_duration = self._scene_duration_seconds(scene)
+            if not SCENE_MIN_DURATION_SECONDS <= render_duration <= SCENE_MAX_DURATION_SECONDS:
+                raise ValueError(
+                    f"장면 재생시간은 {SCENE_MIN_DURATION_SECONDS:.0f}~{SCENE_MAX_DURATION_SECONDS:.0f}초 범위로 입력해 주세요: "
+                    f"{scene.scene_name or scene.video_path}"
+                )
             if not scene.end_time.strip():
                 raise ValueError(f"종료 시간이 비어 있습니다: {scene.scene_name or scene.video_path}")
             start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
@@ -531,7 +599,7 @@ class ExportWorker(QObject):
                     "시간 입력을 확인해 주세요. "
                     f"종료 시간은 시작 시간보다 커야 합니다: {scene.scene_name or scene.video_path}"
                 )
-            scene_durations.append(end_seconds - start_seconds)
+            scene_durations.append(render_duration)
         if self.logo_path and not Path(self.logo_path).exists():
             raise FileNotFoundError(f"로고 파일을 찾을 수 없습니다: {self.logo_path}")
         if self.music_path and not Path(self.music_path).exists():
@@ -556,9 +624,7 @@ class ExportWorker(QObject):
     def _scene_duration_seconds(self, scene: Scene) -> float:
         """장면의 시작/종료 시간으로 렌더링될 클립 길이를 계산합니다."""
 
-        start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
-        end_seconds = parse_time_to_seconds(scene.end_time.strip())
-        return end_seconds - start_seconds
+        return clamp_scene_duration(scene.duration)
 
     def _render_scene(
         self,
@@ -585,6 +651,32 @@ class ExportWorker(QObject):
 
         start_seconds = parse_time_to_seconds(scene.start_time.strip() or "0")
         end_seconds = parse_time_to_seconds(scene.end_time.strip())
+        source_duration_seconds = max(end_seconds - start_seconds, 0.001)
+        duration_mode = normalize_duration_mode(scene.duration_mode)
+        if duration_mode == DURATION_MODE_FREEZE:
+            video_filters.extend(
+                [
+                    f"tpad=stop_mode=clone:stop_duration={duration_seconds:.3f}",
+                    f"trim=duration={duration_seconds:.3f}",
+                    "setpts=PTS-STARTPTS",
+                ]
+            )
+        elif duration_mode == DURATION_MODE_SLOW:
+            pts_factor = duration_seconds / source_duration_seconds
+            video_filters.extend(
+                [
+                    f"setpts={pts_factor:.6f}*PTS",
+                    f"trim=duration={duration_seconds:.3f}",
+                    "setpts=PTS-STARTPTS",
+                ]
+            )
+        else:
+            video_filters.extend(
+                [
+                    f"trim=duration={duration_seconds:.3f}",
+                    "setpts=PTS-STARTPTS",
+                ]
+            )
         if self.subtitle_enabled and scene.subtitle.strip():
             subtitle_file = temp_path / f"subtitle_{index:03d}.ass"
             write_ass_subtitle(subtitle_file, scene.subtitle, duration_seconds)
@@ -615,11 +707,20 @@ class ExportWorker(QObject):
             "-y",
             "-ss",
             format_seconds_for_ffmpeg(start_seconds),
-            "-i",
-            scene.video_path,
-            "-t",
-            format_seconds_for_ffmpeg(duration_seconds),
         ]
+        if duration_mode == DURATION_MODE_LOOP and duration_seconds > source_duration_seconds:
+            command.extend(["-stream_loop", "-1"])
+            input_duration_seconds = duration_seconds
+        else:
+            input_duration_seconds = source_duration_seconds
+        command.extend(
+            [
+                "-t",
+                format_seconds_for_ffmpeg(input_duration_seconds),
+                "-i",
+                scene.video_path,
+            ]
+        )
 
         if self.logo_path:
             command.extend(["-i", self.logo_path])
@@ -808,6 +909,9 @@ def _preview_scene_slice(scene: Scene, use_tail: bool, seconds: float = 2.0) -> 
         scene_name=scene.scene_name,
         start_time=format_seconds_for_display(slice_start),
         end_time=format_seconds_for_display(slice_end),
+        duration=clamp_scene_duration(slice_end - slice_start),
+        transition=scene.transition,
+        duration_mode=scene.duration_mode,
         subtitle=scene.subtitle,
     )
     return sliced_scene, slice_end - slice_start
@@ -1137,7 +1241,9 @@ class MainWindow(QMainWindow):
         self.edge_fade_duration_spin = QDoubleSpinBox()
         self.subtitle_enabled_checkbox = QCheckBox("장면 자막 넣기")
         self.subtitle_enabled_checkbox.setChecked(True)
-        self.table = QTableWidget(0, 5)
+        self.scene_duration_spin = QDoubleSpinBox()
+        self.table = QTableWidget(0, 8)
+        self._updating_scene_duration_spin = False
         self.log_edit = QPlainTextEdit()
         self.progress_bar = QProgressBar()
         self.export_selected_clip_button = QPushButton("선택 구간 클립 저장")
@@ -1237,6 +1343,13 @@ class MainWindow(QMainWindow):
         # Scene management: reorder/delete scenes and restore the salt unloading template.
         scene_box = QGroupBox("3. 장면 목록 정리")
         scene_layout = QGridLayout(scene_box)
+        add_scene_button = QPushButton("장면 추가")
+        copy_button = QPushButton("장면 복사")
+        self.scene_duration_spin.setRange(SCENE_MIN_DURATION_SECONDS, SCENE_MAX_DURATION_SECONDS)
+        self.scene_duration_spin.setSingleStep(1.0)
+        self.scene_duration_spin.setDecimals(1)
+        self.scene_duration_spin.setValue(SCENE_DEFAULT_DURATION_SECONDS)
+        self.scene_duration_spin.setSuffix(" 초")
         left_layout.addWidget(scene_box)
 
         remove_button = QPushButton("선택 장면 삭제")
@@ -1247,6 +1360,10 @@ class MainWindow(QMainWindow):
         scene_layout.addWidget(up_button, 0, 1)
         scene_layout.addWidget(down_button, 0, 2)
         scene_layout.addWidget(template_button, 1, 0, 1, 3)
+        scene_layout.addWidget(QLabel("선택 장면 재생시간"), 2, 0)
+        scene_layout.addWidget(self.scene_duration_spin, 2, 1, 1, 2)
+        scene_layout.addWidget(add_scene_button, 3, 0)
+        scene_layout.addWidget(copy_button, 3, 1, 1, 2)
 
         # Project management: save and reload the current JSON project state.
         project_box = QGroupBox("4. 프로젝트 관리")
@@ -1371,9 +1488,12 @@ class MainWindow(QMainWindow):
         output_button.clicked.connect(self.choose_output)
         clip_output_button.clicked.connect(self.choose_clip_output_dir)
         add_video_button.clicked.connect(self.add_videos)
+        add_scene_button.clicked.connect(self.add_scene)
         remove_button.clicked.connect(self.remove_selected_scene)
+        copy_button.clicked.connect(self.copy_selected_scene)
         up_button.clicked.connect(lambda: self.move_selected_scene(-1))
         down_button.clicked.connect(lambda: self.move_selected_scene(1))
+        self.scene_duration_spin.valueChanged.connect(self.update_selected_scene_duration)
         save_button.clicked.connect(self.save_project)
         save_as_button.clicked.connect(self.save_project_as)
         load_button.clicked.connect(lambda: self.load_project())
@@ -1395,7 +1515,7 @@ class MainWindow(QMainWindow):
     def _setup_table(self) -> None:
         """장면 목록 표의 컬럼과 기본 편집 동작을 설정합니다."""
 
-        headers = ["영상 파일", "장면명", "시작 시간", "종료 시간", "자막"]
+        headers = ["클립", "장면 제목", "시작", "종료", "재생시간(초)", "전환", "길이 보정", "자막"]
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
@@ -1404,8 +1524,12 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
         self.table.itemSelectionChanged.connect(self.load_selected_row_preview)
+        self.table.itemChanged.connect(self._scene_table_item_changed)
 
     def _warn_if_ffmpeg_missing(self) -> None:
         """ffmpeg.exe가 없으면 사용자가 바로 알 수 있도록 안내합니다."""
@@ -1435,13 +1559,19 @@ class MainWindow(QMainWindow):
             scene.scene_name,
             scene.start_time,
             scene.end_time,
-            scene.subtitle,
+            f"{clamp_scene_duration(scene.duration):.1f}",
+            normalize_scene_transition(scene.transition),
         ]
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
-            if column in (2, 3):
+            if column in (2, 3, 4):
                 item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, column, item)
+        self.table.setItem(row, column, item)
+        mode_combo = QComboBox()
+        mode_combo.addItems(list(DURATION_MODE_VALUES.keys()))
+        mode_combo.setCurrentText(DURATION_MODE_LABELS[normalize_duration_mode(scene.duration_mode)])
+        self.table.setCellWidget(row, 6, mode_combo)
+        self.table.setItem(row, 7, QTableWidgetItem(scene.subtitle))
 
     def _scene_from_row(self, row: int) -> Scene:
         """표 한 줄을 Scene 데이터로 변환합니다."""
@@ -1455,8 +1585,18 @@ class MainWindow(QMainWindow):
             scene_name=text(1),
             start_time=text(2) or "00:00:00",
             end_time=text(3),
-            subtitle=text(4),
+            duration=clamp_scene_duration(text(4)),
+            transition=normalize_scene_transition(text(5)),
+            duration_mode=self._duration_mode_from_row(row),
+            subtitle=text(7),
         )
+
+    def _duration_mode_from_row(self, row: int) -> str:
+        widget = self.table.cellWidget(row, 6)
+        if isinstance(widget, QComboBox):
+            return normalize_duration_mode(widget.currentText())
+        item = self.table.item(row, 6)
+        return normalize_duration_mode(item.text() if item else "")
 
     def _set_table_text(self, row: int, column: int, value: str) -> None:
         """표 셀이 비어 있어도 안전하게 값을 넣기 위한 작은 헬퍼입니다."""
@@ -1466,8 +1606,39 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem()
             self.table.setItem(row, column, item)
         item.setText(value)
-        if column in (2, 3):
+        if column in (2, 3, 4):
             item.setTextAlignment(Qt.AlignCenter)
+
+    def _scene_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_scene_duration_spin or item.column() != 4:
+            return
+        duration = clamp_scene_duration(item.text())
+        self._updating_scene_duration_spin = True
+        try:
+            item.setText(f"{duration:.1f}")
+            item.setTextAlignment(Qt.AlignCenter)
+            if item.row() == self.table.currentRow():
+                self.scene_duration_spin.setValue(duration)
+        finally:
+            self._updating_scene_duration_spin = False
+
+    def _sync_duration_spin_to_selected_scene(self) -> None:
+        row = self.table.currentRow()
+        self.scene_duration_spin.setEnabled(row >= 0)
+        if row < 0:
+            return
+        self._updating_scene_duration_spin = True
+        try:
+            self.scene_duration_spin.setValue(clamp_scene_duration(self._scene_from_row(row).duration))
+        finally:
+            self._updating_scene_duration_spin = False
+
+    def update_selected_scene_duration(self, value: float) -> None:
+        if self._updating_scene_duration_spin:
+            return
+        row = self.table.currentRow()
+        if row >= 0:
+            self._set_table_text(row, 4, f"{clamp_scene_duration(value):.1f}")
 
     def load_selected_row_preview(self) -> None:
         """
@@ -1480,6 +1651,7 @@ class MainWindow(QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return
+        self._sync_duration_spin_to_selected_scene()
 
         scene = self._scene_from_row(row)
         video_path = scene.video_path.strip()
@@ -1727,6 +1899,7 @@ class MainWindow(QMainWindow):
                         video_path=file_path,
                         scene_name=scene_name,
                         end_time=duration_text,
+                        duration=clamp_scene_duration(parse_time_to_seconds(duration_text)) if duration_text else SCENE_DEFAULT_DURATION_SECONDS,
                         subtitle=subtitle,
                     )
                 )
@@ -1734,6 +1907,7 @@ class MainWindow(QMainWindow):
                 self.table.item(target_row, 0).setText(file_path)
                 if duration_text and not self.table.item(target_row, 3).text().strip():
                     self.table.item(target_row, 3).setText(duration_text)
+                    self._set_table_text(target_row, 4, f"{clamp_scene_duration(parse_time_to_seconds(duration_text)):.1f}")
 
     def _duration_text_for_video(self, file_path: str) -> str:
         """영상 길이를 읽어 표에 넣을 종료 시간 문자열로 변환합니다."""
@@ -1775,10 +1949,50 @@ class MainWindow(QMainWindow):
                 return row
         return None
 
+    def add_scene(self) -> None:
+        self._append_scene(
+            Scene(
+                scene_name="새 장면",
+                duration=SCENE_DEFAULT_DURATION_SECONDS,
+                transition=SCENE_DEFAULT_TRANSITION,
+            )
+        )
+        self.table.selectRow(self.table.rowCount() - 1)
+
     def remove_selected_scene(self) -> None:
         selected = self.table.currentRow()
-        if selected >= 0:
-            self.table.removeRow(selected)
+        if selected < 0:
+            return
+        answer = QMessageBox.question(self, "장면 삭제", "선택한 장면을 삭제할까요?")
+        if answer != QMessageBox.Yes:
+            return
+        self.table.removeRow(selected)
+        if self.table.rowCount():
+            self.table.selectRow(min(selected, self.table.rowCount() - 1))
+        else:
+            self._sync_duration_spin_to_selected_scene()
+
+    def copy_selected_scene(self) -> None:
+        selected = self.table.currentRow()
+        if selected < 0:
+            return
+        scenes = self._all_scenes()
+        scene = self._scene_from_row(selected)
+        scenes.insert(
+            selected + 1,
+            Scene(
+                video_path=scene.video_path,
+                scene_name=scene.scene_name,
+                start_time=scene.start_time,
+                end_time=scene.end_time,
+                duration=scene.duration,
+                transition=scene.transition,
+                duration_mode=scene.duration_mode,
+                subtitle=scene.subtitle,
+            ),
+        )
+        self._set_scenes(scenes)
+        self.table.selectRow(selected + 1)
 
     def move_selected_scene(self, offset: int) -> None:
         """선택한 장면의 순서를 위/아래로 이동합니다."""
@@ -1958,7 +2172,7 @@ class MainWindow(QMainWindow):
             if start_seconds < 0 or end_seconds <= start_seconds:
                 errors.append(f"{index}번 장면 종료 시간은 시작 시간보다 커야 합니다: {label}")
                 continue
-            duration = end_seconds - start_seconds
+            duration = clamp_scene_duration(scene.duration)
             scene_durations.append(duration)
             total_duration += duration
 
