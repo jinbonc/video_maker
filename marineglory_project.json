@@ -1,5 +1,5 @@
 {
-  "ffmpeg_path": "C:/ffmpeg-2026-05-21-git-0857141823-full_build/bin/ffmpeg.exe",
+  "ffmpeg_path": "C:/ffmpeg/bin/ffmpeg.exe",
   "logo_path": "C:/Users/COMPUTER/Downloads/marine_glory_logo_transparent.png",
   "music_path": "",
   "output_path": "C:\\VisualJinGif\\CodexProject\\video-maker\\marineglory_promo.mp4",
@@ -9,24 +9,24 @@
       "scene_name": "항만 전경",
       "start_time": "00:00:00",
       "end_time": "00:00:04.840",
-      "duration": 8.0,
+      "duration": 15.0,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "안전한 항만 물류의 시작",
       "title": "항만 전경",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/01_항만 전경.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/01_항만 전경.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/02_선박 접안.mp4",
       "scene_name": "선박 접안",
       "start_time": "00:00:00",
       "end_time": "00:00:06.440",
-      "duration": 6.4,
+      "duration": 15.0,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "사포2부두 안전한 선박접안",
       "title": "선박 접안",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/02_선박 접안.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/02_선박 접안.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/03_초기작업1.mp4",
@@ -35,10 +35,10 @@
       "end_time": "00:00:13.220",
       "duration": 13.2,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "초기 하역작업(평탄화작업)",
       "title": "초기작업",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/03_초기작업1.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/03_초기작업1.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/04_초기작업2.mp4",
@@ -47,10 +47,10 @@
       "end_time": "00:00:15.100",
       "duration": 15.1,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "초기 하역작업(평탄화작업)",
       "title": "초기작업2",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/04_초기작업2.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/04_초기작업2.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/09_장비투입.mp4",
@@ -59,10 +59,10 @@
       "end_time": "00:00:14.514",
       "duration": 14.5,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "초기 하역작업",
       "title": "장비투입",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/09_장비투입.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/09_장비투입.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/09_선내작업1.mp4",
@@ -71,10 +71,10 @@
       "end_time": "00:00:09.770",
       "duration": 9.8,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "선내 작업",
       "title": "선내작업",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/09_선내작업1.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/09_선내작업1.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/05_초기작업3.mp4",
@@ -83,10 +83,10 @@
       "end_time": "00:00:41.350",
       "duration": 41.4,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "선내 작업",
       "title": "선내작업",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/05_초기작업3.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/05_초기작업3.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/06_BC-1 컨베이어.mp4",
@@ -95,10 +95,10 @@
       "end_time": "00:00:29.430",
       "duration": 29.4,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "부두 컨베이어 이송",
       "title": "컨베이어이송",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/06_BC-1 컨베이어.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/06_BC-1 컨베이어.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/07_컨베이어이송.mp4",
@@ -107,10 +107,10 @@
       "end_time": "00:00:07.020",
       "duration": 7.0,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "화주사 컨베이어 이송",
       "title": "컨베이어이송",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/07_컨베이어이송.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/07_컨베이어이송.mp4"
     },
     {
       "video_path": "C:/VisualJinGif/CodexProject/video-maker/clips/08_LG야드작업.mp4",
@@ -119,22 +119,22 @@
       "end_time": "00:00:09.840",
       "duration": 9.8,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "안전과 신뢰로 완성하는 하역 작업",
       "title": "야드작업",
-      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/08_LG야드작업.mp4",
-      "duration_mode": "slow"
+      "clip": "C:/VisualJinGif/CodexProject/video-maker/clips/08_LG야드작업.mp4"
     },
     {
-      "video_path": "",
+      "video_path": "E:/하역동영상/자료/IMG_0894.MOV",
       "scene_name": "새 장면",
       "start_time": "00:00:00",
-      "end_time": "",
-      "duration": 5.0,
+      "end_time": "00:00:27.795",
+      "duration": 27.8,
       "transition": "없음",
+      "duration_mode": "slow",
       "subtitle": "",
       "title": "새 장면",
-      "clip": "",
-      "duration_mode": "slow"
+      "clip": "E:/하역동영상/자료/IMG_0894.MOV"
     }
   ],
   "transition_mode": "크로스페이드",
