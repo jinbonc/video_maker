@@ -24,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +136,96 @@ DEFAULT_SCENES: list[tuple[str, str]] = [
 ]
 
 
+OVERLAY_TYPE_TEXT = "text"
+OVERLAY_TYPES = {OVERLAY_TYPE_TEXT, "image"}
+OVERLAY_ANIMATION_NONE = "none"
+OVERLAY_ANIMATION_FADE = "fade"
+OVERLAY_ANIMATIONS = {OVERLAY_ANIMATION_NONE, OVERLAY_ANIMATION_FADE}
+OVERLAY_POSITIONS = {
+    "center",
+    "top",
+    "bottom",
+    "top_left",
+    "top_right",
+    "bottom_left",
+    "bottom_right",
+    "left",
+    "right",
+}
+OVERLAY_DEFAULT_TEXT = {
+    "type": OVERLAY_TYPE_TEXT,
+    "text": "",
+    "start": 0.0,
+    "end": 3.0,
+    "position": "center",
+    "animation": OVERLAY_ANIMATION_NONE,
+    "fade_duration": 0.5,
+    "font_size": 72,
+    "color": "white",
+    "opacity": 1.0,
+}
+
+
+def _overlay_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return min(max(number, minimum), maximum)
+
+
+def _overlay_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return min(max(number, minimum), maximum)
+
+
+def normalize_overlay(overlay: Any) -> dict[str, Any] | None:
+    """Return a safe overlay dictionary, keeping image overlays for future support."""
+
+    if not isinstance(overlay, dict):
+        return None
+
+    overlay_type = str(overlay.get("type", OVERLAY_TYPE_TEXT)).strip().lower()
+    if overlay_type not in OVERLAY_TYPES:
+        return None
+
+    normalized = dict(overlay)
+    normalized["type"] = overlay_type
+    normalized["start"] = _overlay_float(overlay.get("start"), 0.0, 0.0, SCENE_MAX_DURATION_SECONDS)
+    normalized["end"] = _overlay_float(overlay.get("end"), normalized["start"] + 3.0, 0.0, SCENE_MAX_DURATION_SECONDS)
+    normalized["position"] = str(overlay.get("position", "center")).strip().lower()
+    if normalized["position"] not in OVERLAY_POSITIONS:
+        normalized["position"] = "center"
+    normalized["animation"] = str(overlay.get("animation", OVERLAY_ANIMATION_NONE)).strip().lower()
+    if normalized["animation"] not in OVERLAY_ANIMATIONS:
+        normalized["animation"] = OVERLAY_ANIMATION_NONE
+    normalized["fade_duration"] = _overlay_float(overlay.get("fade_duration"), 0.5, 0.0, 10.0)
+    normalized["opacity"] = _overlay_float(overlay.get("opacity"), 1.0, 0.0, 1.0)
+
+    if overlay_type == OVERLAY_TYPE_TEXT:
+        normalized["text"] = str(overlay.get("text", ""))
+        normalized["font_size"] = _overlay_int(overlay.get("font_size"), 72, 8, 400)
+        normalized["color"] = str(overlay.get("color", "white")).strip() or "white"
+    else:
+        normalized["path"] = str(overlay.get("path", ""))
+
+    return normalized
+
+
+def normalize_overlays(overlays: Any) -> list[dict[str, Any]]:
+    if not isinstance(overlays, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for overlay in overlays:
+        safe_overlay = normalize_overlay(overlay)
+        if safe_overlay is not None:
+            normalized.append(safe_overlay)
+    return normalized
+
+
 @dataclass
 class Scene:
     """프로젝트 JSON에 저장되는 장면 정보입니다."""
@@ -148,6 +238,7 @@ class Scene:
     transition: str = SCENE_DEFAULT_TRANSITION
     duration_mode: str = SCENE_DEFAULT_DURATION_MODE
     subtitle: str = ""
+    overlays: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Scene":
@@ -171,6 +262,7 @@ class Scene:
             transition=normalize_scene_transition(data.get("transition", SCENE_DEFAULT_TRANSITION)),
             duration_mode=normalize_duration_mode(data.get("duration_mode", SCENE_DEFAULT_DURATION_MODE)),
             subtitle=str(data.get("subtitle", "")),
+            overlays=normalize_overlays(data.get("overlays", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -180,6 +272,7 @@ class Scene:
         data["duration"] = clamp_scene_duration(self.duration)
         data["transition"] = normalize_scene_transition(self.transition)
         data["duration_mode"] = normalize_duration_mode(self.duration_mode)
+        data["overlays"] = normalize_overlays(self.overlays)
         return data
 
 
@@ -284,6 +377,93 @@ def ffmpeg_filter_path(path: str) -> str:
     escaped = escaped.replace(":", r"\:")
     escaped = escaped.replace("'", r"\'")
     return escaped
+
+
+def escape_drawtext_text(text: str) -> str:
+    """Escape text for ffmpeg drawtext filter option values."""
+
+    return (
+        text.replace("\\", r"\\")
+        .replace("'", r"\'")
+        .replace(":", r"\:")
+        .replace(",", r"\,")
+        .replace("[", r"\[")
+        .replace("]", r"\]")
+        .replace(";", r"\;")
+        .replace("%", r"\%")
+        .replace("\r\n", r"\n")
+        .replace("\n", r"\n")
+    )
+
+
+def overlay_position_expr(position: str) -> tuple[str, str]:
+    margin = 72
+    positions = {
+        "center": ("(w-text_w)/2", "(h-text_h)/2"),
+        "top": ("(w-text_w)/2", str(margin)),
+        "bottom": ("(w-text_w)/2", f"h-text_h-{margin}"),
+        "top_left": (str(margin), str(margin)),
+        "top_right": (f"w-text_w-{margin}", str(margin)),
+        "bottom_left": (str(margin), f"h-text_h-{margin}"),
+        "bottom_right": (f"w-text_w-{margin}", f"h-text_h-{margin}"),
+        "left": (str(margin), "(h-text_h)/2"),
+        "right": (f"w-text_w-{margin}", "(h-text_h)/2"),
+    }
+    return positions.get(position, positions["center"])
+
+
+def build_text_overlay_filter(
+    overlay: dict[str, Any],
+    duration_seconds: float,
+    font_path: str,
+) -> str | None:
+    """Build one drawtext filter for a normalized text overlay."""
+
+    safe_overlay = normalize_overlay(overlay)
+    if safe_overlay is None or safe_overlay.get("type") != OVERLAY_TYPE_TEXT:
+        return None
+
+    text = str(safe_overlay.get("text", "")).strip()
+    if not text:
+        return None
+
+    start = min(max(float(safe_overlay["start"]), 0.0), duration_seconds)
+    end = min(max(float(safe_overlay["end"]), 0.0), duration_seconds)
+    if end <= start:
+        return None
+
+    x_expr, y_expr = overlay_position_expr(str(safe_overlay.get("position", "center")))
+    opacity = float(safe_overlay.get("opacity", 1.0))
+    animation = str(safe_overlay.get("animation", OVERLAY_ANIMATION_NONE))
+    fade_duration = min(float(safe_overlay.get("fade_duration", 0.5)), max((end - start) / 2, 0.0))
+
+    if animation == OVERLAY_ANIMATION_FADE and fade_duration > 0:
+        fade_in_end = start + fade_duration
+        fade_out_start = end - fade_duration
+        alpha_expr = (
+            f"{opacity:.3f}*"
+            f"if(lt(t\\,{fade_in_end:.3f})\\,(t-{start:.3f})/{fade_duration:.3f}\\,"
+            f"if(gt(t\\,{fade_out_start:.3f})\\,({end:.3f}-t)/{fade_duration:.3f}\\,1))"
+        )
+    else:
+        alpha_expr = f"{opacity:.3f}"
+
+    parts = []
+    if font_path:
+        parts.append(f"fontfile='{ffmpeg_filter_path(font_path)}'")
+    parts.extend(
+        [
+            f"text='{escape_drawtext_text(text)}'",
+            "expansion=none",
+            f"fontsize={int(safe_overlay.get('font_size', 72))}",
+            f"fontcolor={escape_drawtext_text(str(safe_overlay.get('color', 'white')))}",
+            f"x={x_expr}",
+            f"y={y_expr}",
+            f"enable='between(t\\,{start:.3f}\\,{end:.3f})'",
+            f"alpha='{alpha_expr}'",
+        ]
+    )
+    return "drawtext=" + ":".join(parts)
 
 
 def parse_time_to_seconds(value: str) -> float:
@@ -774,6 +954,12 @@ class ExportWorker(QObject):
             write_ass_subtitle(subtitle_file, scene.subtitle, duration_seconds)
             video_filters.append(f"subtitles='{ffmpeg_filter_path(str(subtitle_file))}'")
 
+        overlay_font_path = find_korean_font()
+        for overlay in normalize_overlays(scene.overlays):
+            overlay_filter = build_text_overlay_filter(overlay, duration_seconds, overlay_font_path)
+            if overlay_filter:
+                video_filters.append(overlay_filter)
+
         total_scenes = len(self.scenes)
         if self.transition_mode == TRANSITION_FADE_BLACK and total_scenes > 1:
             if index > 1:
@@ -1005,6 +1191,9 @@ def _preview_scene_slice(scene: Scene, use_tail: bool, seconds: float = 2.0) -> 
         transition=scene.transition,
         duration_mode=scene.duration_mode,
         subtitle=scene.subtitle,
+        # Preview slices keep original overlay timings for now; recalculating
+        # start/end against the clipped preview window is a follow-up.
+        overlays=normalize_overlays(scene.overlays),
     )
     return sliced_scene, slice_end - slice_start
 
@@ -1723,6 +1912,9 @@ class MainWindow(QMainWindow):
         mode_combo.setCurrentText(DURATION_MODE_LABELS[normalize_duration_mode(scene.duration_mode)])
         self.table.setCellWidget(row, 6, mode_combo)
         self.table.setItem(row, 7, QTableWidgetItem(scene.subtitle))
+        video_item = self.table.item(row, 0)
+        if video_item is not None:
+            video_item.setData(Qt.UserRole, normalize_overlays(scene.overlays))
 
     def _scene_from_row(self, row: int) -> Scene:
         """표 한 줄을 Scene 데이터로 변환합니다."""
@@ -1731,6 +1923,8 @@ class MainWindow(QMainWindow):
             item = self.table.item(row, column)
             return item.text().strip() if item else ""
 
+        overlay_item = self.table.item(row, 0)
+        overlays = overlay_item.data(Qt.UserRole) if overlay_item is not None else []
         return Scene(
             video_path=text(0),
             scene_name=text(1),
@@ -1740,6 +1934,7 @@ class MainWindow(QMainWindow):
             transition=normalize_scene_transition(text(5)),
             duration_mode=self._duration_mode_from_row(row),
             subtitle=text(7),
+            overlays=normalize_overlays(overlays),
         )
 
     def _duration_mode_from_row(self, row: int) -> str:
@@ -2620,6 +2815,7 @@ class MainWindow(QMainWindow):
                 transition=scene.transition,
                 duration_mode=scene.duration_mode,
                 subtitle=scene.subtitle,
+                overlays=normalize_overlays(scene.overlays),
             ),
         )
         self._set_scenes(scenes)

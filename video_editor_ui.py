@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSplitter,
+    QSpinBox,
     QStyle,
     QToolButton,
     QVBoxLayout,
@@ -140,6 +141,7 @@ class SceneEditorWindow(QMainWindow):
         self.project_path: Path | None = None
         self.project_data: dict[str, Any] = {"scenes": []}
         self.current_scene_index = -1
+        self.current_overlay_index = -1
         self.updating_ui = False
         self.slider_is_pressed = False
         self.loaded_preview_path: Path | None = None
@@ -301,6 +303,78 @@ class SceneEditorWindow(QMainWindow):
         form.addRow("전체 전환 효과", self.transition_combo)
         form.addRow("전체 전환 시간", self.transition_duration_spin)
         right_layout.addWidget(form_container)
+
+        overlay_container = QFrame()
+        overlay_container.setFrameShape(QFrame.StyledPanel)
+        overlay_layout = QVBoxLayout(overlay_container)
+        overlay_layout.addWidget(QLabel("텍스트 오버레이"))
+
+        self.overlay_list = QListWidget()
+        self.overlay_list.setMinimumHeight(90)
+        overlay_layout.addWidget(self.overlay_list)
+
+        overlay_buttons = QHBoxLayout()
+        self.overlay_add_button = QPushButton("추가")
+        self.overlay_remove_button = QPushButton("삭제")
+        self.overlay_up_button = QPushButton("위로")
+        self.overlay_down_button = QPushButton("아래로")
+        overlay_buttons.addWidget(self.overlay_add_button)
+        overlay_buttons.addWidget(self.overlay_remove_button)
+        overlay_buttons.addWidget(self.overlay_up_button)
+        overlay_buttons.addWidget(self.overlay_down_button)
+        overlay_layout.addLayout(overlay_buttons)
+
+        overlay_form = QFormLayout()
+        self.overlay_text_edit = QLineEdit()
+        self.overlay_start_spin = QDoubleSpinBox()
+        self.overlay_start_spin.setRange(0.0, 60.0)
+        self.overlay_start_spin.setSingleStep(0.1)
+        self.overlay_start_spin.setDecimals(2)
+        self.overlay_start_spin.setSuffix(" 초")
+        self.overlay_end_spin = QDoubleSpinBox()
+        self.overlay_end_spin.setRange(0.0, 60.0)
+        self.overlay_end_spin.setSingleStep(0.1)
+        self.overlay_end_spin.setDecimals(2)
+        self.overlay_end_spin.setSuffix(" 초")
+        self.overlay_position_combo = QComboBox()
+        self.overlay_position_combo.addItems(
+            [
+                "center",
+                "top",
+                "bottom",
+                "top_left",
+                "top_right",
+                "bottom_left",
+                "bottom_right",
+                "left",
+                "right",
+            ]
+        )
+        self.overlay_font_size_spin = QSpinBox()
+        self.overlay_font_size_spin.setRange(8, 400)
+        self.overlay_font_size_spin.setValue(72)
+        self.overlay_color_combo = QComboBox()
+        self.overlay_color_combo.setEditable(True)
+        self.overlay_color_combo.addItems(["white", "black", "yellow", "red", "blue"])
+        self.overlay_animation_combo = QComboBox()
+        self.overlay_animation_combo.addItems(["none", "fade"])
+        self.overlay_fade_spin = QDoubleSpinBox()
+        self.overlay_fade_spin.setRange(0.0, 10.0)
+        self.overlay_fade_spin.setSingleStep(0.1)
+        self.overlay_fade_spin.setDecimals(2)
+        self.overlay_fade_spin.setSuffix(" 초")
+
+        overlay_form.addRow("텍스트", self.overlay_text_edit)
+        overlay_form.addRow("시작", self.overlay_start_spin)
+        overlay_form.addRow("종료", self.overlay_end_spin)
+        overlay_form.addRow("위치", self.overlay_position_combo)
+        overlay_form.addRow("글자 크기", self.overlay_font_size_spin)
+        overlay_form.addRow("색상", self.overlay_color_combo)
+        overlay_form.addRow("애니메이션", self.overlay_animation_combo)
+        overlay_form.addRow("fade 시간", self.overlay_fade_spin)
+        overlay_layout.addLayout(overlay_form)
+        right_layout.addWidget(overlay_container)
+
         right_layout.addStretch(1)
         splitter.addWidget(right_panel)
         splitter.setSizes([260, 650, 390])
@@ -355,6 +429,188 @@ class SceneEditorWindow(QMainWindow):
         self.duration_mode_combo.currentTextChanged.connect(lambda _text="": self.apply_editor_to_scene())
         self.transition_combo.currentTextChanged.connect(lambda _text="": self.apply_editor_to_scene())
         self.transition_duration_spin.valueChanged.connect(lambda _value=0.0: self.apply_editor_to_scene())
+        self.overlay_list.currentRowChanged.connect(self.select_overlay)
+        self.overlay_add_button.clicked.connect(self.add_text_overlay)
+        self.overlay_remove_button.clicked.connect(self.remove_overlay)
+        self.overlay_up_button.clicked.connect(lambda: self.move_overlay(-1))
+        self.overlay_down_button.clicked.connect(lambda: self.move_overlay(1))
+        self.overlay_text_edit.textChanged.connect(lambda _text="": self.apply_overlay_editor_to_scene())
+        self.overlay_start_spin.valueChanged.connect(lambda _value=0.0: self.apply_overlay_editor_to_scene())
+        self.overlay_end_spin.valueChanged.connect(lambda _value=0.0: self.apply_overlay_editor_to_scene())
+        self.overlay_position_combo.currentTextChanged.connect(lambda _text="": self.apply_overlay_editor_to_scene())
+        self.overlay_font_size_spin.valueChanged.connect(lambda _value=0: self.apply_overlay_editor_to_scene())
+        self.overlay_color_combo.currentTextChanged.connect(lambda _text="": self.apply_overlay_editor_to_scene())
+        self.overlay_animation_combo.currentTextChanged.connect(lambda _text="": self.apply_overlay_editor_to_scene())
+        self.overlay_fade_spin.valueChanged.connect(lambda _value=0.0: self.apply_overlay_editor_to_scene())
+
+    def _current_scene(self) -> dict[str, Any] | None:
+        row = self.current_scene_index
+        if row < 0 or row >= len(self.scenes):
+            return None
+        return self.scenes[row]
+
+    def _scene_overlays(self, scene: dict[str, Any]) -> list[dict[str, Any]]:
+        overlays = video_maker.normalize_overlays(scene.get("overlays", []))
+        scene["overlays"] = overlays
+        return overlays
+
+    def _overlay_summary(self, overlay: dict[str, Any], index: int) -> str:
+        text = str(overlay.get("text", "")).strip() or "(빈 텍스트)"
+        start = float(overlay.get("start", 0.0))
+        end = float(overlay.get("end", 0.0))
+        position = str(overlay.get("position", "center"))
+        animation = str(overlay.get("animation", "none"))
+        return f"{index + 1:02d}. {text}  {start:.2f}-{end:.2f}s  {position}  {animation}"
+
+    def refresh_overlay_list(self, overlays: Any, selected_row: int = 0) -> None:
+        safe_overlays = video_maker.normalize_overlays(overlays)
+        was_blocked = self.overlay_list.blockSignals(True)
+        try:
+            self.overlay_list.clear()
+            for index, overlay in enumerate(safe_overlays):
+                self.overlay_list.addItem(QListWidgetItem(self._overlay_summary(overlay, index)))
+            if safe_overlays:
+                selected_row = min(max(selected_row, 0), len(safe_overlays) - 1)
+                self.overlay_list.setCurrentRow(selected_row)
+                self.current_overlay_index = selected_row
+                self._load_overlay_editor(safe_overlays[selected_row])
+            else:
+                self.current_overlay_index = -1
+                self._clear_overlay_editor()
+        finally:
+            self.overlay_list.blockSignals(was_blocked)
+
+    def _set_overlay_editor_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.overlay_text_edit,
+            self.overlay_start_spin,
+            self.overlay_end_spin,
+            self.overlay_position_combo,
+            self.overlay_font_size_spin,
+            self.overlay_color_combo,
+            self.overlay_animation_combo,
+            self.overlay_fade_spin,
+            self.overlay_remove_button,
+            self.overlay_up_button,
+            self.overlay_down_button,
+        ):
+            widget.setEnabled(enabled)
+
+    def _clear_overlay_editor(self) -> None:
+        previous = self.updating_ui
+        self.updating_ui = True
+        try:
+            self.overlay_text_edit.clear()
+            self.overlay_start_spin.setValue(0.0)
+            self.overlay_end_spin.setValue(0.0)
+            self.overlay_position_combo.setCurrentText("center")
+            self.overlay_font_size_spin.setValue(72)
+            self.overlay_color_combo.setCurrentText("white")
+            self.overlay_animation_combo.setCurrentText("none")
+            self.overlay_fade_spin.setValue(0.5)
+            self._set_overlay_editor_enabled(False)
+        finally:
+            self.updating_ui = previous
+
+    def _load_overlay_editor(self, overlay: dict[str, Any]) -> None:
+        previous = self.updating_ui
+        self.updating_ui = True
+        try:
+            self._set_overlay_editor_enabled(True)
+            self.overlay_text_edit.setText(str(overlay.get("text", "")))
+            self.overlay_start_spin.setValue(float(overlay.get("start", 0.0)))
+            self.overlay_end_spin.setValue(float(overlay.get("end", 0.0)))
+            self.overlay_position_combo.setCurrentText(str(overlay.get("position", "center")))
+            self.overlay_font_size_spin.setValue(int(overlay.get("font_size", 72)))
+            self.overlay_color_combo.setCurrentText(str(overlay.get("color", "white")))
+            self.overlay_animation_combo.setCurrentText(str(overlay.get("animation", "none")))
+            self.overlay_fade_spin.setValue(float(overlay.get("fade_duration", 0.5)))
+        finally:
+            self.updating_ui = previous
+
+    def select_overlay(self, row: int) -> None:
+        scene = self._current_scene()
+        if scene is None:
+            self.current_overlay_index = -1
+            self._clear_overlay_editor()
+            return
+        overlays = self._scene_overlays(scene)
+        self.current_overlay_index = row
+        if row < 0 or row >= len(overlays):
+            self.current_overlay_index = -1
+            self._clear_overlay_editor()
+            return
+        self._load_overlay_editor(overlays[row])
+
+    def add_text_overlay(self) -> None:
+        scene = self._current_scene()
+        if scene is None:
+            return
+        overlays = self._scene_overlays(scene)
+        new_overlay = dict(video_maker.OVERLAY_DEFAULT_TEXT)
+        new_overlay["text"] = "MARINEGLORY"
+        new_overlay["start"] = 0.5
+        new_overlay["end"] = min(4.0, scene_final_duration(scene))
+        new_overlay["animation"] = "fade"
+        overlays.append(new_overlay)
+        scene["overlays"] = overlays
+        self.refresh_overlay_list(overlays, len(overlays) - 1)
+
+    def remove_overlay(self) -> None:
+        scene = self._current_scene()
+        if scene is None:
+            return
+        overlays = self._scene_overlays(scene)
+        row = self.current_overlay_index
+        if row < 0 or row >= len(overlays):
+            return
+        overlays.pop(row)
+        scene["overlays"] = overlays
+        self.refresh_overlay_list(overlays, min(row, len(overlays) - 1))
+
+    def move_overlay(self, delta: int) -> None:
+        scene = self._current_scene()
+        if scene is None:
+            return
+        overlays = self._scene_overlays(scene)
+        row = self.current_overlay_index
+        target = row + delta
+        if row < 0 or target < 0 or target >= len(overlays):
+            return
+        overlays[row], overlays[target] = overlays[target], overlays[row]
+        scene["overlays"] = overlays
+        self.refresh_overlay_list(overlays, target)
+
+    def apply_overlay_editor_to_scene(self) -> None:
+        if self.updating_ui:
+            return
+        scene = self._current_scene()
+        if scene is None:
+            return
+        overlays = self._scene_overlays(scene)
+        row = self.current_overlay_index
+        if row < 0 or row >= len(overlays):
+            return
+
+        overlays[row] = video_maker.normalize_overlay(
+            {
+                **overlays[row],
+                "type": "text",
+                "text": self.overlay_text_edit.text(),
+                "start": self.overlay_start_spin.value(),
+                "end": self.overlay_end_spin.value(),
+                "position": self.overlay_position_combo.currentText(),
+                "font_size": self.overlay_font_size_spin.value(),
+                "color": self.overlay_color_combo.currentText(),
+                "animation": self.overlay_animation_combo.currentText(),
+                "fade_duration": self.overlay_fade_spin.value(),
+                "opacity": overlays[row].get("opacity", 1.0),
+            }
+        ) or dict(video_maker.OVERLAY_DEFAULT_TEXT)
+        scene["overlays"] = overlays
+        item = self.overlay_list.item(row)
+        if item is not None:
+            item.setText(self._overlay_summary(overlays[row], row))
 
     def choose_project(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -376,6 +632,10 @@ class SceneEditorWindow(QMainWindow):
         if not isinstance(data, dict) or not isinstance(data.get("scenes", []), list):
             QMessageBox.warning(self, "프로젝트 형식 확인", "scenes 목록이 있는 JSON 파일을 선택해 주세요.")
             return
+
+        for scene in data.get("scenes", []):
+            if isinstance(scene, dict):
+                scene["overlays"] = video_maker.normalize_overlays(scene.get("overlays", []))
 
         self.media_player.stop()
         self.project_path = path
@@ -441,6 +701,7 @@ class SceneEditorWindow(QMainWindow):
             transition = str(self.project_data.get("transition_mode", "크로스페이드"))
             self.transition_combo.setCurrentText(transition if transition in TRANSITION_MODES else "크로스페이드")
             self.transition_duration_spin.setValue(float(self.project_data.get("transition_duration", 0.7)))
+            self.refresh_overlay_list(scene.get("overlays", []))
             self._update_preview_source(show_missing_message=True)
             self._update_duration_label()
         self.updating_ui = False
@@ -455,6 +716,7 @@ class SceneEditorWindow(QMainWindow):
         self.duration_label.setText("-")
         self.final_duration_spin.setValue(SCENE_DEFAULT_DURATION_SECONDS)
         self.duration_mode_combo.setCurrentText(duration_mode_label(None))
+        self.refresh_overlay_list([])
         self.preview_path_label.setText("선택한 씬의 클립 경로가 표시됩니다.")
         self.loaded_preview_path = None
         self.media_player.stop()
@@ -483,6 +745,7 @@ class SceneEditorWindow(QMainWindow):
         scene["end_time"] = self.end_time_edit.text().strip()
         scene["duration"] = video_maker.clamp_scene_duration(self.final_duration_spin.value())
         scene["duration_mode"] = duration_mode_value(self.duration_mode_combo.currentText())
+        scene["overlays"] = video_maker.normalize_overlays(scene.get("overlays", []))
         self.project_data["transition_mode"] = self.transition_combo.currentText()
         self.project_data["transition_duration"] = self.transition_duration_spin.value()
         self._update_duration_label()
