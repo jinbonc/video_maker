@@ -1278,6 +1278,82 @@ def render_transition_preview(
     return output_file
 
 
+def render_scene_effect_preview(
+    project_path: str | Path,
+    scene_index: int,
+    output_path: str | Path,
+    log_callback: Any | None = None,
+) -> Path:
+    """
+    Render one selected scene with the same per-scene effects used by final export.
+
+    This preview includes duration correction, ASS subtitles, text overlays, logo,
+    and project edge fades, but skips inter-scene transitions.
+    """
+
+    project_file = Path(project_path)
+    data = json.loads(project_file.read_text(encoding="utf-8"))
+    project = Project.from_dict(data)
+    scenes = project.scenes or []
+    if scene_index < 0 or scene_index >= len(scenes):
+        raise ValueError("현재 씬 효과 미리보기를 만들 씬을 선택해 주세요.")
+
+    ffmpeg_path = project.ffmpeg_path or find_default_ffmpeg()
+    if not ffmpeg_path or not Path(ffmpeg_path).exists():
+        raise FileNotFoundError("ffmpeg.exe 경로가 없습니다. main.py에서 ffmpeg 경로를 지정해 저장해 주세요.")
+
+    project_dir = project_file.resolve().parent
+    selected_scene = scenes[scene_index]
+    if selected_scene.video_path and not Path(selected_scene.video_path).is_absolute():
+        selected_scene.video_path = str((project_dir / selected_scene.video_path).resolve())
+    if project.logo_path and not Path(project.logo_path).is_absolute():
+        project.logo_path = str((project_dir / project.logo_path).resolve())
+
+    if not selected_scene.video_path or not Path(selected_scene.video_path).exists():
+        raise FileNotFoundError(f"현재 씬 효과 미리보기용 클립 파일을 찾을 수 없습니다: {selected_scene.video_path}")
+    if not selected_scene.end_time.strip():
+        raise ValueError(f"현재 씬 효과 미리보기를 만들려면 종료 시간이 필요합니다: {selected_scene.scene_name or selected_scene.video_path}")
+    if project.logo_path and not Path(project.logo_path).exists():
+        raise FileNotFoundError(f"로고 파일을 찾을 수 없습니다: {project.logo_path}")
+
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    start_seconds = parse_time_to_seconds(selected_scene.start_time.strip() or "0")
+    end_seconds = parse_time_to_seconds(selected_scene.end_time.strip())
+    source_duration_seconds = max(end_seconds - start_seconds, 0.001)
+    duration_seconds = clamp_scene_duration(selected_scene.duration)
+    if selected_scene.duration is None:
+        duration_seconds = clamp_scene_duration(source_duration_seconds)
+
+    temp_path = output_file.parent / f".{output_file.stem}_work"
+    if temp_path.exists():
+        shutil.rmtree(temp_path, ignore_errors=True)
+    temp_path.mkdir(parents=True, exist_ok=True)
+    try:
+        worker = ExportWorker(
+            ffmpeg_path=ffmpeg_path,
+            scenes=[selected_scene],
+            logo_path=project.logo_path,
+            music_path="",
+            output_path=str(output_file),
+            transition_mode=TRANSITION_NONE,
+            transition_duration=0.0,
+            fade_in_enabled=project.fade_in_enabled,
+            fade_out_enabled=project.fade_out_enabled,
+            edge_fade_duration=project.edge_fade_duration,
+            subtitle_enabled=project.subtitle_enabled,
+        )
+        if log_callback is not None:
+            worker.log.connect(log_callback)
+        rendered_clip = worker._render_scene(selected_scene, 1, temp_path, duration_seconds)
+        shutil.copy2(rendered_clip, output_file)
+    finally:
+        shutil.rmtree(temp_path, ignore_errors=True)
+
+    return output_file
+
+
 class ClipExportWorker(QObject):
     """원본 영상의 지정 구간만 잘라 개별 MP4 클립으로 저장하는 작업자입니다."""
 

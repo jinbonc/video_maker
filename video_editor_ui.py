@@ -184,6 +184,7 @@ class SceneEditorWindow(QMainWindow):
         generate_label = "저장 후 제작 화면 확인" if self.opened_from_main else "제작 화면 열기"
         self.generate_button = QPushButton(generate_label)
         self.preview_output_button = QPushButton("전체 결과 미리보기")
+        self.scene_effect_preview_button = QPushButton("현재 씬 효과 미리보기")
         self.transition_preview_button = QPushButton("전환 미리보기 생성")
         self.path_label = QLabel("프로젝트가 열리지 않았습니다.")
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -192,6 +193,7 @@ class SceneEditorWindow(QMainWindow):
         toolbar.addWidget(self.save_button)
         toolbar.addWidget(self.generate_button)
         toolbar.addWidget(self.preview_output_button)
+        toolbar.addWidget(self.scene_effect_preview_button)
         toolbar.addWidget(self.transition_preview_button)
         toolbar.addWidget(self.path_label)
         root.addLayout(toolbar)
@@ -403,6 +405,7 @@ class SceneEditorWindow(QMainWindow):
         self.save_button.clicked.connect(self.save_project)
         self.generate_button.clicked.connect(self.run_main_py)
         self.preview_output_button.clicked.connect(self.preview_full_output)
+        self.scene_effect_preview_button.clicked.connect(self.create_scene_effect_preview)
         self.transition_preview_button.clicked.connect(self.create_transition_preview)
         self.scene_list.currentRowChanged.connect(self.select_scene)
         self.play_button.clicked.connect(self.play_preview)
@@ -867,6 +870,44 @@ class SceneEditorWindow(QMainWindow):
         self.preview_path_label.setText(f"전체 결과 미리보기\n실제 경로: {path}")
         self.media_player.stop()
         self.media_player.setSource(QUrl.fromLocalFile(str(path)))
+        self.media_player.play()
+
+    def create_scene_effect_preview(self) -> None:
+        row = self.current_scene_index
+        if row < 0 or row >= len(self.scenes):
+            QMessageBox.information(self, "현재 씬 효과 미리보기", "효과를 확인할 씬을 선택해 주세요.")
+            return
+
+        self.apply_editor_to_scene(flush_refresh=True)
+        if self.project_path is None:
+            self.save_project()
+            if self.project_path is None:
+                return
+        if not self._write_project(self.project_path):
+            return
+
+        output_path = self.project_path.parent / "preview" / f"scene_effect_preview_{row + 1:02d}.mp4"
+        self.scene_effect_preview_button.setEnabled(False)
+        self.preview_path_label.setText("현재 씬 효과 미리보기를 생성 중입니다. 장면 길이에 따라 시간이 걸릴 수 있습니다.")
+        QApplication.processEvents()
+        try:
+            rendered_path = video_maker.render_scene_effect_preview(
+                self.project_path,
+                row,
+                output_path,
+                log_callback=lambda message: self.preview_path_label.setText(message),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "현재 씬 효과 미리보기 실패", str(exc))
+            self.preview_path_label.setText("현재 씬 효과 미리보기 생성 실패")
+            return
+        finally:
+            self.scene_effect_preview_button.setEnabled(True)
+
+        self.loaded_preview_path = rendered_path
+        self.preview_path_label.setText(f"현재 씬 효과 미리보기\n실제 경로: {rendered_path}")
+        self.media_player.stop()
+        self.media_player.setSource(QUrl.fromLocalFile(str(rendered_path)))
         self.media_player.play()
 
     def create_transition_preview(self) -> None:
