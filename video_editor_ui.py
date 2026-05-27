@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import main as video_maker
-from PySide6.QtCore import QSize, Qt, QUrl
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -94,17 +94,24 @@ def format_duration(start_time: str, end_time: str) -> str:
 
 
 class SceneEditorWindow(QMainWindow):
-    def __init__(self, project_file: str | Path | None = None) -> None:
+    def __init__(self, project_file: str | Path | None = None, opened_from_main: bool = False) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(1320, 780)
 
+        self.opened_from_main = opened_from_main
         self.project_path: Path | None = None
         self.project_data: dict[str, Any] = {"scenes": []}
         self.current_scene_index = -1
         self.updating_ui = False
         self.slider_is_pressed = False
         self.loaded_preview_path: Path | None = None
+        self._pending_scene_list_refresh = False
+        self._pending_timeline_refresh = False
+        self.editor_refresh_timer = QTimer(self)
+        self.editor_refresh_timer.setSingleShot(True)
+        self.editor_refresh_timer.setInterval(200)
+        self.editor_refresh_timer.timeout.connect(self._flush_editor_refresh)
 
         self.media_player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -135,7 +142,8 @@ class SceneEditorWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.open_button = QPushButton("프로젝트 열기")
         self.save_button = QPushButton("저장")
-        self.generate_button = QPushButton("제작 화면 열기")
+        generate_label = "저장 후 제작 화면 확인" if self.opened_from_main else "제작 화면 열기"
+        self.generate_button = QPushButton(generate_label)
         self.preview_output_button = QPushButton("전체 결과 미리보기")
         self.transition_preview_button = QPushButton("전환 미리보기 생성")
         self.path_label = QLabel("프로젝트가 열리지 않았습니다.")
@@ -288,13 +296,13 @@ class SceneEditorWindow(QMainWindow):
         self.media_player.positionChanged.connect(self._media_position_changed)
         self.media_player.durationChanged.connect(self._media_duration_changed)
 
-        self.title_edit.textChanged.connect(self.apply_editor_to_scene)
-        self.clip_path_edit.textChanged.connect(self.apply_editor_to_scene)
+        self.title_edit.textChanged.connect(lambda _text="": self.apply_editor_to_scene(scene_list=True, timeline=True))
+        self.clip_path_edit.textChanged.connect(self._clip_path_changed)
         self.subtitle_edit.textChanged.connect(self.apply_editor_to_scene)
-        self.start_time_edit.textChanged.connect(self.apply_editor_to_scene)
-        self.end_time_edit.textChanged.connect(self.apply_editor_to_scene)
-        self.transition_combo.currentTextChanged.connect(self.apply_editor_to_scene)
-        self.transition_duration_spin.valueChanged.connect(self.apply_editor_to_scene)
+        self.start_time_edit.textChanged.connect(lambda _text="": self.apply_editor_to_scene(timeline=True))
+        self.end_time_edit.textChanged.connect(lambda _text="": self.apply_editor_to_scene(timeline=True))
+        self.transition_combo.currentTextChanged.connect(lambda _text="": self.apply_editor_to_scene())
+        self.transition_duration_spin.valueChanged.connect(lambda _value=0.0: self.apply_editor_to_scene())
 
     def choose_project(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -332,12 +340,16 @@ class SceneEditorWindow(QMainWindow):
 
     def refresh_scene_list(self) -> None:
         self.updating_ui = True
-        self.scene_list.clear()
-        for index, scene in enumerate(self.scenes, start=1):
-            title = str(scene.get("scene_name") or Path(str(scene.get("video_path", ""))).stem or "이름 없는 씬")
-            item = QListWidgetItem(f"{index:02d}. {title}")
-            self.scene_list.addItem(item)
-        self.updating_ui = False
+        was_blocked = self.scene_list.blockSignals(True)
+        try:
+            self.scene_list.clear()
+            for index, scene in enumerate(self.scenes, start=1):
+                title = str(scene.get("scene_name") or Path(str(scene.get("video_path", ""))).stem or "이름 없는 씬")
+                item = QListWidgetItem(f"{index:02d}. {title}")
+                self.scene_list.addItem(item)
+        finally:
+            self.scene_list.blockSignals(was_blocked)
+            self.updating_ui = False
 
     def refresh_timeline(self) -> None:
         while self.timeline_layout.count():
@@ -359,7 +371,7 @@ class SceneEditorWindow(QMainWindow):
         self.timeline_layout.addStretch(1)
 
     def select_scene(self, row: int) -> None:
-        self.apply_editor_to_scene()
+        self.apply_editor_to_scene(flush_refresh=True)
         self.current_scene_index = row
         self.updating_ui = True
         if row < 0 or row >= len(self.scenes):
@@ -393,7 +405,13 @@ class SceneEditorWindow(QMainWindow):
         self._media_duration_changed(0)
         self._media_position_changed(0)
 
-    def apply_editor_to_scene(self) -> None:
+    def apply_editor_to_scene(
+        self,
+        scene_list: bool = False,
+        timeline: bool = False,
+        preview: bool = False,
+        flush_refresh: bool = False,
+    ) -> None:
         if self.updating_ui:
             return
         row = self.current_scene_index
@@ -409,9 +427,29 @@ class SceneEditorWindow(QMainWindow):
         self.project_data["transition_mode"] = self.transition_combo.currentText()
         self.project_data["transition_duration"] = self.transition_duration_spin.value()
         self._update_duration_label()
-        self._update_preview_source()
-        self.refresh_scene_list_preserving_row(row)
-        self.refresh_timeline()
+        if preview:
+            self._update_preview_source()
+        if scene_list or timeline:
+            self._schedule_editor_refresh(scene_list=scene_list, timeline=timeline)
+        if flush_refresh:
+            self._flush_editor_refresh()
+
+    def _clip_path_changed(self, *_args: Any) -> None:
+        self.apply_editor_to_scene(scene_list=True, preview=True)
+
+    def _schedule_editor_refresh(self, scene_list: bool = False, timeline: bool = False) -> None:
+        self._pending_scene_list_refresh = self._pending_scene_list_refresh or scene_list
+        self._pending_timeline_refresh = self._pending_timeline_refresh or timeline
+        self.editor_refresh_timer.start()
+
+    def _flush_editor_refresh(self) -> None:
+        row = self.current_scene_index
+        if self._pending_scene_list_refresh:
+            self.refresh_scene_list_preserving_row(row)
+        if self._pending_timeline_refresh:
+            self.refresh_timeline()
+        self._pending_scene_list_refresh = False
+        self._pending_timeline_refresh = False
 
     def refresh_scene_list_preserving_row(self, row: int) -> None:
         self.refresh_scene_list()
@@ -522,7 +560,7 @@ class SceneEditorWindow(QMainWindow):
             )
             return
 
-        self.apply_editor_to_scene()
+        self.apply_editor_to_scene(flush_refresh=True)
         if self.project_path is None:
             self.save_project()
             if self.project_path is None:
@@ -592,14 +630,14 @@ class SceneEditorWindow(QMainWindow):
         new_row = row + delta
         if row < 0 or new_row < 0 or new_row >= len(self.scenes):
             return
-        self.apply_editor_to_scene()
+        self.apply_editor_to_scene(flush_refresh=True)
         self.scenes[row], self.scenes[new_row] = self.scenes[new_row], self.scenes[row]
         self.refresh_scene_list()
         self.scene_list.setCurrentRow(new_row)
         self.refresh_timeline()
 
     def save_project(self) -> None:
-        self.apply_editor_to_scene()
+        self.apply_editor_to_scene(flush_refresh=True)
         path = self.project_path
         if path is None:
             file_path, _ = QFileDialog.getSaveFileName(
@@ -631,12 +669,32 @@ class SceneEditorWindow(QMainWindow):
         return True
 
     def run_main_py(self) -> None:
-        self.apply_editor_to_scene()
+        self.apply_editor_to_scene(flush_refresh=True)
         if self.project_path is None:
             self.save_project()
             if self.project_path is None:
                 return
         if not self._write_project(self.project_path):
+            return
+        self.path_label.setText(str(self.project_path))
+        if self.opened_from_main:
+            QMessageBox.information(
+                self,
+                "프로젝트 저장 완료",
+                "프로젝트를 저장했습니다.\n\n"
+                "뒤에 열려 있는 MarineGlory Video Maker 제작 화면에서 [프로젝트 불러오기]를 눌러 갱신하거나, "
+                "기존 제작 화면으로 돌아가 작업을 계속하세요.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "새 제작 화면 열기",
+            "프로젝트를 저장했습니다.\n\n새 제작 화면을 하나 더 열까요?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
             return
         project_arg = self.project_path
         main_path = app_dir() / "main.py"
@@ -649,13 +707,16 @@ class SceneEditorWindow(QMainWindow):
             QMessageBox.critical(self, "제작 화면 열기 실패", str(exc))
 
 
-def main(project_file: str | None = None) -> int:
+def main(project_file: str | None = None, opened_from_main: bool = False) -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    window = SceneEditorWindow(project_file)
+    window = SceneEditorWindow(project_file, opened_from_main=opened_from_main)
     window.show()
     return app.exec()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1] if len(sys.argv) > 1 else None))
+    args = [arg for arg in sys.argv[1:] if arg]
+    opened_from_main = "--opened-from-main" in args
+    project_args = [arg for arg in args if arg != "--opened-from-main"]
+    raise SystemExit(main(project_args[0] if project_args else None, opened_from_main=opened_from_main))

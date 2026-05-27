@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -515,6 +516,7 @@ def read_video_duration_seconds(ffmpeg_path: str, video_path: str, log: Any | No
                 encoding="utf-8",
                 errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                timeout=10,
             )
             output = process.stdout.strip()
             duration = float(output) if output else 0.0
@@ -525,20 +527,27 @@ def read_video_duration_seconds(ffmpeg_path: str, video_path: str, log: Any | No
                 "ffprobe 영상 길이 읽기 실패: "
                 f"returncode={process.returncode}, output={_short_process_output(process.stdout)}"
             )
+        except subprocess.TimeoutExpired:
+            emit(f"ffprobe 실행 시간 초과: {video_path}")
         except Exception as exc:
             emit(f"ffprobe 실행 실패: {exc}")
     else:
         emit("ffprobe.exe를 찾지 못해 ffmpeg -i 출력 파싱으로 길이를 읽습니다.")
 
-    process = subprocess.run(
-        [ffmpeg_path, "-hide_banner", "-i", video_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-    )
+    try:
+        process = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-i", video_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        emit(f"ffmpeg 영상 길이 읽기 시간 초과: {video_path}")
+        return None
     match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", process.stdout)
     if not match:
         emit(
@@ -1353,6 +1362,13 @@ class MainWindow(QMainWindow):
         self.preview_stop_at_ms: int | None = None
         self.preview_duration_check_token = 0
         self.preview_frame_timer = QTimer(self)
+        self.duration_cache: dict[str, float] = {}
+        self._refreshing_scene_table = False
+        self._selection_event_count = 0
+        self._last_selection_row: int | None = None
+        self.scene_selection_timer = QTimer(self)
+        self.scene_selection_timer.setSingleShot(True)
+        self.scene_selection_timer.setInterval(150)
 
         self.worker_thread: QThread | None = None
         self.worker: ExportWorker | None = None
@@ -1614,6 +1630,7 @@ class MainWindow(QMainWindow):
         self.preview_slider.valueChanged.connect(self._preview_slider_value_changed)
         self.preview_frame_timer.setInterval(500)
         self.preview_frame_timer.timeout.connect(self._advance_frame_preview_playback)
+        self.scene_selection_timer.timeout.connect(self.load_selected_row_preview)
 
         ffmpeg_button.clicked.connect(self.choose_ffmpeg)
         logo_button.clicked.connect(self.choose_logo)
@@ -1661,7 +1678,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
-        self.table.itemSelectionChanged.connect(self.load_selected_row_preview)
+        self.table.itemSelectionChanged.connect(self._queue_selected_row_preview)
         self.table.itemChanged.connect(self._scene_table_item_changed)
 
     def _warn_if_ffmpeg_missing(self) -> None:
@@ -1678,9 +1695,7 @@ class MainWindow(QMainWindow):
     def _load_default_template(self) -> None:
         """프로그램 시작 시 기본 10개 장면 템플릿을 표에 넣습니다."""
 
-        self.table.setRowCount(0)
-        for scene_name, subtitle in DEFAULT_SCENES:
-            self._append_scene(Scene(scene_name=scene_name, subtitle=subtitle))
+        self._set_scenes([Scene(scene_name=scene_name, subtitle=subtitle) for scene_name, subtitle in DEFAULT_SCENES])
 
     def _append_scene(self, scene: Scene) -> None:
         """표 마지막에 장면 한 줄을 추가합니다."""
@@ -1743,6 +1758,8 @@ class MainWindow(QMainWindow):
             item.setTextAlignment(Qt.AlignCenter)
 
     def _scene_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._refreshing_scene_table:
+            return
         if self._updating_scene_duration_from_range:
             return
         if item.column() in (2, 3):
@@ -1813,6 +1830,16 @@ class MainWindow(QMainWindow):
         if row >= 0:
             self._set_table_text(row, 4, f"{clamp_scene_duration(value):.1f}")
 
+    def _queue_selected_row_preview(self) -> None:
+        if self._refreshing_scene_table:
+            return
+        row = self.table.currentRow()
+        self._selection_event_count += 1
+        if row == self._last_selection_row:
+            self.log(f"장면 선택 이벤트 중복 감지: row={row + 1 if row >= 0 else row}, count={self._selection_event_count}")
+        self._last_selection_row = row
+        self.scene_selection_timer.start()
+
     def load_selected_row_preview(self) -> None:
         """
         표에서 선택한 행의 원본 영상을 프로그램 안 미리보기 플레이어에 로드합니다.
@@ -1822,11 +1849,13 @@ class MainWindow(QMainWindow):
         """
 
         row = self.table.currentRow()
-        if row < 0:
+        if row < 0 or self._refreshing_scene_table:
             return
+        started_at = time.perf_counter()
         self._sync_duration_spin_to_selected_scene()
 
         scene = self._scene_from_row(row)
+        self.log(f"장면 선택 시작: row={row + 1}, title={scene.scene_name or '(제목 없음)'}")
         video_path = scene.video_path.strip()
         if not video_path:
             self.log(
@@ -1841,39 +1870,55 @@ class MainWindow(QMainWindow):
             self.log(f"미리보기: 영상 파일을 찾을 수 없습니다: {video_path}")
             return
 
+        start_text = scene.start_time.strip() or "00:00:00"
+        try:
+            start_seconds = parse_time_to_seconds(start_text)
+        except ValueError:
+            start_seconds = 0.0
+
         if video_path != self.preview_original_path:
             self.preview_stop_at_ms = None
             self.preview_frame_timer.stop()
             self.preview_original_path = video_path
-            self.current_preview_seconds = 0.0
-            self.preview_total_seconds = read_video_duration_seconds(
-                self.ffmpeg_edit.text().strip(),
-                video_path,
-                self.log,
-            ) or 0.0
-            total_ms = int(max(self.preview_total_seconds, 0.0) * 1000)
-            self.preview_slider.setRange(0, total_ms)
-            self._update_preview_time_label(0, total_ms)
-            preview_path = self._create_preview_proxy(video_path) or video_path
-            self._load_video_into_preview(preview_path, video_path)
+            self.current_preview_seconds = start_seconds
+            self.preview_total_seconds = self._known_cached_duration_for(video_path) or 0.0
+            self._load_video_into_preview(video_path, video_path, seek_seconds=start_seconds, auto_frame_fallback=False)
+        else:
+            self.current_preview_seconds = start_seconds
+            start_ms = int(max(start_seconds, 0.0) * 1000)
+            if self.preview_mode == "player":
+                self.preview_player.setPosition(start_ms)
+            else:
+                self.preview_slider.setValue(start_ms)
+                self._update_preview_time_label(start_ms, int(max(self.preview_total_seconds, 0.0) * 1000))
 
-        start_text = scene.start_time.strip() or "00:00:00"
         end_text = scene.end_time.strip() or "(미입력)"
         self.log(f"선택 장면 구간: 시작 {start_text}, 종료 {end_text}")
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        self.log(f"장면 선택 완료: row={row + 1}, elapsed={elapsed_ms:.1f}ms")
 
-    def _load_video_into_preview(self, preview_path: str, original_path: str) -> None:
+    def _load_video_into_preview(
+        self,
+        preview_path: str,
+        original_path: str,
+        seek_seconds: float = 0.0,
+        auto_frame_fallback: bool = True,
+    ) -> None:
         """QMediaPlayer에 미리보기 파일을 로드하고 duration 0 상태를 별도로 확인합니다."""
 
         self.preview_mode = "player"
         self.preview_stack.setCurrentIndex(0)
         self.preview_current_path = preview_path
         self.preview_player.setSource(QUrl.fromLocalFile(preview_path))
-        self.preview_slider.setValue(0)
-        self.current_preview_seconds = 0.0
+        start_ms = int(max(seek_seconds, 0.0) * 1000)
         total_ms = int(max(self.preview_total_seconds, 0.0) * 1000)
         if total_ms > 0:
             self.preview_slider.setRange(0, total_ms)
-            self._update_preview_time_label(0, total_ms)
+        self.preview_slider.setValue(start_ms)
+        self.preview_player.setPosition(start_ms)
+        self.current_preview_seconds = max(seek_seconds, 0.0)
+        if total_ms > 0:
+            self._update_preview_time_label(start_ms, total_ms)
         else:
             self.preview_time_label.setText("00:00:00 / 00:00:00")
         if preview_path != original_path:
@@ -1883,8 +1928,9 @@ class MainWindow(QMainWindow):
             self.preview_mode_label.setText("선택한 원본 클립의 구간을 확인합니다.")
             self.log(f"미리보기 원본 로드: {preview_path}")
         self.preview_duration_check_token += 1
-        token = self.preview_duration_check_token
-        QTimer.singleShot(1500, lambda: self._check_preview_duration_after_load(token, original_path))
+        if auto_frame_fallback:
+            token = self.preview_duration_check_token
+            QTimer.singleShot(1500, lambda: self._check_preview_duration_after_load(token, original_path))
 
     def _check_preview_duration_after_load(self, token: int, original_path: str) -> None:
         """setSource 뒤에도 길이가 0이면 QtMultimedia 코덱 문제 가능성을 안내합니다."""
@@ -1909,11 +1955,7 @@ class MainWindow(QMainWindow):
         self.preview_original_path = video_path
         self.preview_current_path = video_path
         if self.preview_total_seconds <= 0:
-            self.preview_total_seconds = read_video_duration_seconds(
-                self.ffmpeg_edit.text().strip(),
-                video_path,
-                self.log,
-            ) or 0.0
+            self.preview_total_seconds = self._cached_duration_for(video_path) or 0.0
         total_ms = int(max(self.preview_total_seconds, 0.0) * 1000)
         self.preview_slider.setRange(0, total_ms)
         self.current_preview_seconds = max(0.0, min(self.current_preview_seconds, self.preview_total_seconds))
@@ -1954,15 +1996,25 @@ class MainWindow(QMainWindow):
             "scale=960:-2",
             str(frame_path),
         ]
-        process = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
+        started_at = time.perf_counter()
+        self.log(f"preview frame 추출 시작: {video_path}, seconds={safe_seconds:.3f}")
+        try:
+            process = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired as exc:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            self.log(f"preview frame 추출 시간 초과: elapsed={elapsed_ms:.1f}ms")
+            raise RuntimeError("ffmpeg 프레임 추출 시간 초과") from exc
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        self.log(f"preview frame 추출 종료: elapsed={elapsed_ms:.1f}ms")
         if process.returncode != 0 or not frame_path.exists() or frame_path.stat().st_size <= 0:
             self.log(
                 "ffmpeg 프레임 추출 실패: "
@@ -2036,7 +2088,11 @@ class MainWindow(QMainWindow):
                 encoding="utf-8",
                 errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                timeout=10,
             )
+        except subprocess.TimeoutExpired:
+            self.log("미리보기 전체 프록시 생성 시간 초과")
+            return ""
         except Exception as exc:
             self.log(f"미리보기 전체 프록시 생성 실패: {exc}")
             return ""
@@ -2297,15 +2353,21 @@ class MainWindow(QMainWindow):
             str(output_path),
         ]
         self.log("frame 모드 선택 구간 미리보기 생성 시작: " + " ".join(f'"{part}"' if " " in part else part for part in command))
-        process = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
+        try:
+            process = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            self.log("frame 모드 선택 구간 미리보기 생성 시간 초과")
+            QMessageBox.warning(self, "미리보기 생성 실패", "선택 구간 미리보기 MP4 생성 시간이 초과되었습니다.")
+            return
         if process.returncode != 0 or not output_path.exists() or output_path.stat().st_size <= 0:
             self.log(
                 "frame 모드 선택 구간 미리보기 생성 실패: "
@@ -2327,15 +2389,54 @@ class MainWindow(QMainWindow):
     def _set_scenes(self, scenes: list[Scene]) -> None:
         """JSON 불러오기나 행 이동 후 표 전체를 다시 그립니다."""
 
-        self.table.setRowCount(0)
-        for scene in scenes:
-            self._append_scene(scene)
+        started_at = time.perf_counter()
+        previous_row = self.table.currentRow()
+        self._refreshing_scene_table = True
+        signals_were_blocked = self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(0)
+            for scene in scenes:
+                self._append_scene(scene)
+            if scenes:
+                restore_row = min(max(previous_row, 0), len(scenes) - 1)
+                self.table.selectRow(restore_row)
+            else:
+                self.table.clearSelection()
+        finally:
+            self.table.blockSignals(signals_were_blocked)
+            self._refreshing_scene_table = False
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        self.log(f"테이블 refresh 완료: rows={len(scenes)}, elapsed={elapsed_ms:.1f}ms")
 
     def log(self, message: str) -> None:
         """GUI 로그 창에 메시지를 누적합니다."""
 
         self.log_edit.appendPlainText(message)
         self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
+
+    def _cached_duration_for(self, video_path: str, log_cache_hit: bool = True) -> float | None:
+        """Return a cached ffprobe/ffmpeg duration for one source video."""
+
+        if not video_path:
+            return None
+        key = str(Path(video_path).resolve())
+        if key in self.duration_cache:
+            if log_cache_hit:
+                self.log(f"영상 길이 캐시 사용: {Path(video_path).name} = {self.duration_cache[key]:.3f}초")
+            return self.duration_cache[key]
+        started_at = time.perf_counter()
+        self.log(f"ffprobe 호출 시작: {video_path}")
+        duration = read_video_duration_seconds(self.ffmpeg_edit.text().strip(), video_path, self.log)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        self.log(f"ffprobe 호출 종료: {video_path}, elapsed={elapsed_ms:.1f}ms")
+        if duration is not None:
+            self.duration_cache[key] = duration
+        return duration
+
+    def _known_cached_duration_for(self, video_path: str) -> float | None:
+        if not video_path:
+            return None
+        return self.duration_cache.get(str(Path(video_path).resolve()))
 
     def choose_ffmpeg(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -2441,7 +2542,7 @@ class MainWindow(QMainWindow):
     def _duration_text_for_video(self, file_path: str) -> str:
         """영상 길이를 읽어 표에 넣을 종료 시간 문자열로 변환합니다."""
 
-        duration = read_video_duration_seconds(self.ffmpeg_edit.text().strip(), file_path, self.log)
+        duration = self._cached_duration_for(file_path)
         if duration is None:
             self.log(f"파일은 존재하지만 ffmpeg가 길이를 읽지 못했습니다: {file_path}")
             self.log(f"영상 길이 자동 입력 실패: {file_path}")
@@ -2457,11 +2558,7 @@ class MainWindow(QMainWindow):
         changed = False
         for scene in scenes:
             if scene.video_path.strip() and not scene.end_time.strip():
-                duration = read_video_duration_seconds(
-                    self.ffmpeg_edit.text().strip(),
-                    scene.video_path,
-                    self.log,
-                )
+                duration = self._cached_duration_for(scene.video_path)
                 if duration is None:
                     warnings.append(f"종료 시간 자동 입력 실패: {scene.scene_name or scene.video_path}")
                     continue
@@ -2618,7 +2715,7 @@ class MainWindow(QMainWindow):
 
         try:
             subprocess.Popen(
-                [sys.executable, str(editor_path), str(self.project_path)],
+                [sys.executable, str(editor_path), str(self.project_path), "--opened-from-main"],
                 cwd=str(application_dir()),
             )
             self.log(f"씬 편집 화면 열기: {self.project_path}")
