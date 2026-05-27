@@ -47,6 +47,9 @@ from PySide6.QtWidgets import (
 APP_NAME = "MarineGlory Scene Editor"
 PROJECT_FILE = "marineglory_project.json"
 TRANSITION_MODES = ["없음", "크로스페이드", "페이드 투 블랙"]
+DURATION_MODE_LABELS = video_maker.DURATION_MODE_LABELS
+DURATION_MODE_VALUES = video_maker.DURATION_MODE_VALUES
+SCENE_DEFAULT_DURATION_SECONDS = video_maker.SCENE_DEFAULT_DURATION_SECONDS
 
 
 def app_dir() -> Path:
@@ -91,6 +94,40 @@ def format_duration(start_time: str, end_time: str) -> str:
     if minutes:
         return f"{minutes}분 {seconds:.1f}초"
     return f"{seconds:.1f}초"
+
+
+def format_duration_seconds(duration: float | None) -> str:
+    if duration is None or duration <= 0:
+        return "-"
+    minutes = int(duration // 60)
+    seconds = duration - minutes * 60
+    if minutes:
+        return f"{minutes}분 {seconds:.1f}초"
+    return f"{seconds:.1f}초"
+
+
+def source_duration_seconds(scene: dict[str, Any]) -> float | None:
+    start_seconds = parse_time(str(scene.get("start_time", "")))
+    end_seconds = parse_time(str(scene.get("end_time", "")))
+    if start_seconds is None or end_seconds is None or end_seconds <= start_seconds:
+        return None
+    return end_seconds - start_seconds
+
+
+def scene_final_duration(scene: dict[str, Any]) -> float:
+    value = scene.get("duration")
+    if value is None:
+        source_seconds = source_duration_seconds(scene)
+        value = source_seconds if source_seconds is not None else SCENE_DEFAULT_DURATION_SECONDS
+    return video_maker.clamp_scene_duration(value)
+
+
+def duration_mode_value(value: Any) -> str:
+    return video_maker.normalize_duration_mode(value)
+
+
+def duration_mode_label(value: Any) -> str:
+    return DURATION_MODE_LABELS[duration_mode_value(value)]
 
 
 class SceneEditorWindow(QMainWindow):
@@ -234,8 +271,19 @@ class SceneEditorWindow(QMainWindow):
         self.start_time_edit = QLineEdit()
         self.end_time_edit = QLineEdit()
         self.duration_label = QLabel("-")
+        self.final_duration_spin = QDoubleSpinBox()
+        self.final_duration_spin.setRange(
+            video_maker.SCENE_MIN_DURATION_SECONDS,
+            video_maker.SCENE_MAX_DURATION_SECONDS,
+        )
+        self.final_duration_spin.setSingleStep(1.0)
+        self.final_duration_spin.setDecimals(1)
+        self.final_duration_spin.setSuffix(" 초")
+        self.duration_mode_combo = QComboBox()
+        self.duration_mode_combo.addItems(list(DURATION_MODE_VALUES.keys()))
         self.transition_combo = QComboBox()
         self.transition_combo.addItems(TRANSITION_MODES)
+        self.transition_combo.setToolTip("최종 제작 화면의 전체 장면 전환 방식입니다. 장면별 transition 값은 현재 최종 렌더링에서 사용하지 않습니다.")
         self.transition_duration_spin = QDoubleSpinBox()
         self.transition_duration_spin.setRange(0.0, 5.0)
         self.transition_duration_spin.setSingleStep(0.1)
@@ -247,9 +295,11 @@ class SceneEditorWindow(QMainWindow):
         form.addRow("자막 내용", self.subtitle_edit)
         form.addRow("자막 시작 시간", self.start_time_edit)
         form.addRow("자막 종료 시간", self.end_time_edit)
-        form.addRow("씬 길이", self.duration_label)
-        form.addRow("전환 효과", self.transition_combo)
-        form.addRow("전환 시간", self.transition_duration_spin)
+        form.addRow("원본 구간 길이", self.duration_label)
+        form.addRow("최종 재생시간", self.final_duration_spin)
+        form.addRow("길이 보정", self.duration_mode_combo)
+        form.addRow("전체 전환 효과", self.transition_combo)
+        form.addRow("전체 전환 시간", self.transition_duration_spin)
         right_layout.addWidget(form_container)
         right_layout.addStretch(1)
         splitter.addWidget(right_panel)
@@ -301,6 +351,8 @@ class SceneEditorWindow(QMainWindow):
         self.subtitle_edit.textChanged.connect(self.apply_editor_to_scene)
         self.start_time_edit.textChanged.connect(lambda _text="": self.apply_editor_to_scene(timeline=True))
         self.end_time_edit.textChanged.connect(lambda _text="": self.apply_editor_to_scene(timeline=True))
+        self.final_duration_spin.valueChanged.connect(lambda _value=0.0: self.apply_editor_to_scene(timeline=True))
+        self.duration_mode_combo.currentTextChanged.connect(lambda _text="": self.apply_editor_to_scene())
         self.transition_combo.currentTextChanged.connect(lambda _text="": self.apply_editor_to_scene())
         self.transition_duration_spin.valueChanged.connect(lambda _value=0.0: self.apply_editor_to_scene())
 
@@ -360,10 +412,11 @@ class SceneEditorWindow(QMainWindow):
 
         for index, scene in enumerate(self.scenes):
             title = str(scene.get("scene_name") or f"{index + 1}번 씬")
-            duration = format_duration(str(scene.get("start_time", "")), str(scene.get("end_time", "")))
-            button = QPushButton(f"{index + 1}\n{title}\n{duration}")
-            button.setMinimumWidth(132)
-            button.setMaximumWidth(180)
+            source_duration = format_duration(str(scene.get("start_time", "")), str(scene.get("end_time", "")))
+            final_duration = format_duration_seconds(scene_final_duration(scene))
+            button = QPushButton(f"{index + 1}\n{title}\n원본 {source_duration} / 최종 {final_duration}")
+            button.setMinimumWidth(190)
+            button.setMaximumWidth(240)
             button.setCheckable(True)
             button.setChecked(index == self.current_scene_index)
             button.clicked.connect(lambda checked=False, row=index: self.scene_list.setCurrentRow(row))
@@ -383,6 +436,8 @@ class SceneEditorWindow(QMainWindow):
             self.subtitle_edit.setPlainText(str(scene.get("subtitle", "")))
             self.start_time_edit.setText(str(scene.get("start_time", "00:00:00")))
             self.end_time_edit.setText(str(scene.get("end_time", "")))
+            self.final_duration_spin.setValue(scene_final_duration(scene))
+            self.duration_mode_combo.setCurrentText(duration_mode_label(scene.get("duration_mode")))
             transition = str(self.project_data.get("transition_mode", "크로스페이드"))
             self.transition_combo.setCurrentText(transition if transition in TRANSITION_MODES else "크로스페이드")
             self.transition_duration_spin.setValue(float(self.project_data.get("transition_duration", 0.7)))
@@ -398,6 +453,8 @@ class SceneEditorWindow(QMainWindow):
         self.start_time_edit.clear()
         self.end_time_edit.clear()
         self.duration_label.setText("-")
+        self.final_duration_spin.setValue(SCENE_DEFAULT_DURATION_SECONDS)
+        self.duration_mode_combo.setCurrentText(duration_mode_label(None))
         self.preview_path_label.setText("선택한 씬의 클립 경로가 표시됩니다.")
         self.loaded_preview_path = None
         self.media_player.stop()
@@ -424,6 +481,8 @@ class SceneEditorWindow(QMainWindow):
         scene["subtitle"] = self.subtitle_edit.toPlainText()
         scene["start_time"] = self.start_time_edit.text().strip()
         scene["end_time"] = self.end_time_edit.text().strip()
+        scene["duration"] = video_maker.clamp_scene_duration(self.final_duration_spin.value())
+        scene["duration_mode"] = duration_mode_value(self.duration_mode_combo.currentText())
         self.project_data["transition_mode"] = self.transition_combo.currentText()
         self.project_data["transition_duration"] = self.transition_duration_spin.value()
         self._update_duration_label()

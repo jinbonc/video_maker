@@ -1665,8 +1665,11 @@ class MainWindow(QMainWindow):
     def _setup_table(self) -> None:
         """장면 목록 표의 컬럼과 기본 편집 동작을 설정합니다."""
 
-        headers = ["클립", "장면 제목", "시작", "종료", "재생시간(초)", "전환", "길이 보정", "자막"]
+        headers = ["클립", "장면 제목", "시작", "종료", "재생시간(초)", "전환(참고)", "길이 보정", "자막"]
         self.table.setHorizontalHeaderLabels(headers)
+        transition_header = self.table.horizontalHeaderItem(5)
+        if transition_header is not None:
+            transition_header.setToolTip("현재 최종 렌더링은 아래 최종 홍보영상 만들기의 전체 장면 전환 방식을 사용합니다.")
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.verticalHeader().setVisible(True)
